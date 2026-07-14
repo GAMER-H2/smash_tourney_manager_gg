@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from "vue";
+import CharacterPicker from "./CharacterPicker.vue";
 
 const props = defineProps({
   title: {
@@ -36,7 +37,7 @@ const emit = defineEmits([
   "close",
   "set-best-of",
   "set-player-name",
-  "set-character",
+  "set-game-character",
   "toggle-game-winner",
   "apply-overlay",
   "submit",
@@ -99,15 +100,6 @@ const gameIndices = computed(() =>
             :value="setData.player1.name"
             @input="emit('set-player-name', { player: 1, value: $event.target.value })"
           />
-          <select
-            :value="setData.player1.character"
-            @change="emit('set-character', { player: 1, value: $event.target.value })"
-          >
-            <option value="">Character</option>
-            <option v-for="character in characters" :key="character" :value="character">
-              {{ character }}
-            </option>
-          </select>
           <p class="score">{{ p1Wins }}</p>
         </div>
 
@@ -117,38 +109,45 @@ const gameIndices = computed(() =>
             :value="setData.player2.name"
             @input="emit('set-player-name', { player: 2, value: $event.target.value })"
           />
-          <select
-            :value="setData.player2.character"
-            @change="emit('set-character', { player: 2, value: $event.target.value })"
-          >
-            <option value="">Character</option>
-            <option v-for="character in characters" :key="character" :value="character">
-              {{ character }}
-            </option>
-          </select>
           <p class="score">{{ p2Wins }}</p>
         </div>
       </div>
 
       <div class="games-list">
         <div v-for="index in gameIndices" :key="index" class="game-row">
-          <button
-            type="button"
-            class="win-btn"
-            :class="{ active: setData.games[index]?.winner === 1 }"
-            @click="emit('toggle-game-winner', { index, winner: 1 })"
-          >
-            W
-          </button>
-          <span class="game-label">Game {{ index + 1 }}</span>
-          <button
-            type="button"
-            class="win-btn"
-            :class="{ active: setData.games[index]?.winner === 2 }"
-            @click="emit('toggle-game-winner', { index, winner: 2 })"
-          >
-            W
-          </button>
+          <div class="game-controls">
+            <button
+              type="button"
+              class="win-btn"
+              :class="{ active: setData.games[index]?.winner === 1 }"
+              @click="emit('toggle-game-winner', { index, winner: 1 })"
+            >
+              W
+            </button>
+            <span class="game-label">Game {{ index + 1 }}</span>
+            <button
+              type="button"
+              class="win-btn"
+              :class="{ active: setData.games[index]?.winner === 2 }"
+              @click="emit('toggle-game-winner', { index, winner: 2 })"
+            >
+              W
+            </button>
+          </div>
+          <div class="game-characters">
+            <CharacterPicker
+              :model-value="setData.games[index]?.player1Character"
+              :characters="characters"
+              label="P1 character"
+              @update:model-value="(value) => emit('set-game-character', { index, player: 1, value })"
+            />
+            <CharacterPicker
+              :model-value="setData.games[index]?.player2Character"
+              :characters="characters"
+              label="P2 character"
+              @update:model-value="(value) => emit('set-game-character', { index, player: 2, value })"
+            />
+          </div>
         </div>
       </div>
 
@@ -243,13 +242,31 @@ const gameIndices = computed(() =>
 
 .games-list {
   display: grid;
-  gap: 6px;
+  gap: 10px;
 }
 
 .game-row {
   display: grid;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.game-row:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.game-controls {
+  display: grid;
   grid-template-columns: 56px 1fr 56px;
   align-items: center;
+  gap: 8px;
+}
+
+.game-characters {
+  display: flex;
+  justify-content: space-between;
   gap: 8px;
 }
 

@@ -1,5 +1,6 @@
 <script setup>
-import { computed } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { buildBracketLayout, buildRoundRobinGrid } from "../lib/bracket-utils";
 
 const props = defineProps({
   tournamentData: {
@@ -24,30 +25,107 @@ const activeBucket = computed(() => {
   );
 });
 
-const groupedByRound = computed(() => {
-  const sets = activeBucket.value?.sets ?? [];
-  const map = new Map();
+const layout = computed(() => buildBracketLayout(activeBucket.value?.sets ?? []));
 
-  for (const set of sets) {
-    const key = set.roundText || "Other";
-    if (!map.has(key)) {
-      map.set(key, []);
-    }
-    map.get(key).push(set);
+const winnersColumns = computed(() => [...layout.value.winners, ...layout.value.grandFinal]);
+
+const poolGrid = computed(() => buildRoundRobinGrid(activeBucket.value?.sets ?? []));
+
+function isWinnerSlot(set, slot) {
+  return Boolean(set.winnerId && slot?.entrantId && slot.entrantId === set.winnerId);
+}
+
+// --- Connector line drawing ---
+// Match cards register themselves so we can measure real rendered positions
+// (rather than guessing coordinates) and draw SVG connectors between the
+// matches that the start.gg API tells us actually feed into each other.
+const canvasEl = ref(null);
+const cardEls = new Map();
+const slotEls = new Map();
+
+function setCardRef(setId, el) {
+  if (el) cardEls.set(setId, el);
+  else cardEls.delete(setId);
+}
+
+function setSlotRef(setId, slotNumber, el) {
+  const key = `${setId}:${slotNumber}`;
+  if (el) slotEls.set(key, el);
+  else slotEls.delete(key);
+}
+
+const connectors = reactive([]);
+
+function recomputeConnectors() {
+  const canvas = canvasEl.value;
+  if (!canvas) {
+    connectors.length = 0;
+    return;
   }
 
-  return Array.from(map.entries()).map(([round, roundSets]) => ({
-    round,
-    sets: roundSets,
-  }));
+  const canvasRect = canvas.getBoundingClientRect();
+  const paths = [];
+
+  for (const edge of layout.value.edges) {
+    const fromCard = cardEls.get(edge.fromSetId);
+    const toSlot = slotEls.get(`${edge.toSetId}:${edge.toSlot}`);
+    if (!fromCard || !toSlot) continue;
+
+    const fromRect = fromCard.getBoundingClientRect();
+    const toRect = toSlot.getBoundingClientRect();
+
+    const x1 = fromRect.right - canvasRect.left;
+    const y1 = fromRect.top + fromRect.height / 2 - canvasRect.top;
+    const x2 = toRect.left - canvasRect.left;
+    const y2 = toRect.top + toRect.height / 2 - canvasRect.top;
+    const midX = x1 + Math.max(16, (x2 - x1) / 2);
+
+    paths.push({
+      id: `${edge.fromSetId}-${edge.toSetId}-${edge.toSlot}`,
+      d: `M ${x1} ${y1} H ${midX} V ${y2} H ${x2}`,
+    });
+  }
+
+  connectors.length = 0;
+  connectors.push(...paths);
+}
+
+let resizeObserver = null;
+let rafHandle = null;
+
+function scheduleRecompute() {
+  if (rafHandle) cancelAnimationFrame(rafHandle);
+  rafHandle = requestAnimationFrame(() => {
+    rafHandle = null;
+    recomputeConnectors();
+  });
+}
+
+onMounted(() => {
+  scheduleRecompute();
+  window.addEventListener("resize", scheduleRecompute);
+
+  if (typeof ResizeObserver !== "undefined" && canvasEl.value) {
+    resizeObserver = new ResizeObserver(() => scheduleRecompute());
+    resizeObserver.observe(canvasEl.value);
+  }
 });
 
-function stateLabel(state) {
-  if (state === 3) return "Completed";
-  if (state === 2) return "In Progress";
-  if (state === 1) return "Ready";
-  return "Pending";
-}
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", scheduleRecompute);
+  if (resizeObserver) resizeObserver.disconnect();
+  if (rafHandle) cancelAnimationFrame(rafHandle);
+});
+
+watch(
+  () => layout.value,
+  async () => {
+    cardEls.clear();
+    slotEls.clear();
+    await nextTick();
+    scheduleRecompute();
+  },
+);
 </script>
 
 <template>
@@ -83,24 +161,125 @@ function stateLabel(state) {
       No sets returned for this view.
     </div>
 
-    <div v-else class="round-lane">
-      <div v-for="group in groupedByRound" :key="group.round" class="round-col">
-        <h3>{{ group.round }}</h3>
-        <article
-          v-for="set in group.sets"
-          :key="set.id"
-          class="set-card"
-          @click="emit('quick-report', set)"
-          @contextmenu.prevent="emit('set-on-stream', set)"
-        >
-          <div class="set-head">
-            <strong>#{{ set.id }}</strong>
-            <span>{{ stateLabel(set.state) }}</span>
+    <div v-else-if="layout.isBracket" class="bracket-scroll">
+      <div class="bracket-canvas" ref="canvasEl">
+        <div class="bracket-row">
+          <div v-for="col in winnersColumns" :key="col.key" class="bracket-col">
+            <h3>{{ col.label }}</h3>
+            <div v-for="set in col.sets" :key="set.id" class="match-row">
+              <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
+              <article
+                class="match-card"
+                :ref="(el) => setCardRef(set.id, el)"
+                @click="emit('quick-report', set)"
+                @contextmenu.prevent="emit('set-on-stream', set)"
+              >
+                <div
+                  class="slot-row"
+                  :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
+                  :ref="(el) => setSlotRef(set.id, 1, el)"
+                >
+                  <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
+                </div>
+                <div
+                  class="slot-row"
+                  :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
+                  :ref="(el) => setSlotRef(set.id, 2, el)"
+                >
+                  <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
+                </div>
+              </article>
+            </div>
           </div>
-          <p>{{ set.player1.name }} <strong>{{ set.player1.score }}</strong></p>
-          <p>{{ set.player2.name }} <strong>{{ set.player2.score }}</strong></p>
-        </article>
+        </div>
+
+        <div v-if="layout.losers.length" class="bracket-row losers-row">
+          <div v-for="col in layout.losers" :key="col.key" class="bracket-col">
+            <h3>{{ col.label }}</h3>
+            <div v-for="set in col.sets" :key="set.id" class="match-row">
+              <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
+              <article
+                class="match-card"
+                :ref="(el) => setCardRef(set.id, el)"
+                @click="emit('quick-report', set)"
+                @contextmenu.prevent="emit('set-on-stream', set)"
+              >
+                <div
+                  class="slot-row"
+                  :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
+                  :ref="(el) => setSlotRef(set.id, 1, el)"
+                >
+                  <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
+                </div>
+                <div
+                  class="slot-row"
+                  :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
+                  :ref="(el) => setSlotRef(set.id, 2, el)"
+                >
+                  <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
+                </div>
+              </article>
+            </div>
+          </div>
+        </div>
+
+        <svg class="connector-svg">
+          <path
+            v-for="connector in connectors"
+            :key="connector.id"
+            :d="connector.d"
+            fill="none"
+          />
+        </svg>
       </div>
+    </div>
+
+    <div v-else-if="!poolGrid.entrants.length" class="empty-state">
+      No entrants found for this pool.
+    </div>
+
+    <div v-else class="pool-grid-scroll">
+      <table class="pool-grid">
+        <thead>
+          <tr>
+            <th class="corner-cell"></th>
+            <th v-for="col in poolGrid.entrants" :key="col.id" class="col-header">
+              {{ col.name }}
+            </th>
+            <th class="record-header"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in poolGrid.rows" :key="row.entrant.id">
+            <th class="row-header">{{ row.entrant.name }}</th>
+            <td
+              v-for="(cell, index) in row.cells"
+              :key="index"
+              class="pool-cell"
+              :class="{
+                self: cell.kind === 'self',
+                empty: cell.kind === 'empty',
+                won: cell.kind === 'set' && cell.rowWon,
+                lost: cell.kind === 'set' && cell.rowLost,
+              }"
+              @click="cell.kind === 'set' && emit('quick-report', cell.set)"
+              @contextmenu.prevent="cell.kind === 'set' && emit('set-on-stream', cell.set)"
+            >
+              <span v-if="cell.kind === 'set'" class="pool-score">
+                {{ cell.rowScore }} - {{ cell.colScore }}
+              </span>
+            </td>
+            <td class="record-cell">
+              <div class="set-record">{{ row.record.setWins }} - {{ row.record.setLosses }}</div>
+              <div class="game-record">{{ row.record.gameWins }} - {{ row.record.gameLosses }}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </section>
 </template>
@@ -110,6 +289,7 @@ function stateLabel(state) {
   border: 1px solid var(--panel-border);
   border-radius: 8px;
   background: var(--panel-bg);
+  min-width: 0;
 }
 
 .panel-header {
@@ -166,49 +346,248 @@ function stateLabel(state) {
   opacity: 0.8;
 }
 
-.round-lane {
-  display: flex;
-  gap: 12px;
+/* --- Pool round-robin grid --- */
+.pool-grid-scroll {
   overflow-x: auto;
-  padding: 12px;
-  min-height: 250px;
+  min-width: 0;
+  padding: 16px;
 }
 
-.round-col {
-  min-width: 240px;
+.pool-grid {
+  border-collapse: separate;
+  border-spacing: 6px;
 }
 
-.round-col h3 {
-  margin: 0 0 8px;
+.corner-cell,
+.record-header {
+  border: none;
+}
+
+.col-header {
+  min-width: 110px;
+  max-width: 160px;
+  padding: 4px 8px;
   font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.row-header {
+  padding: 4px 10px 4px 0;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.pool-cell {
+  min-width: 90px;
+  height: 40px;
+  padding: 0 6px;
+  text-align: center;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.pool-cell.self {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.pool-cell:not(.self):not(.empty) {
+  cursor: pointer;
+  border: 1px solid var(--panel-border);
+}
+
+.pool-cell.won {
+  border-color: #238f4f;
+  background: rgba(35, 143, 79, 0.12);
+}
+
+.pool-cell.lost {
+  border-color: #a11e1e;
+  background: rgba(161, 30, 30, 0.1);
+}
+
+.pool-score {
+  font-size: 13px;
   font-weight: 700;
 }
 
-.set-card {
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  padding: 8px;
-  margin-bottom: 8px;
-  cursor: pointer;
+.pool-cell.won .pool-score {
+  color: #238f4f;
 }
 
-.set-card:hover {
+.pool-cell.lost .pool-score {
+  color: #a11e1e;
+}
+
+.record-cell {
+  padding-left: 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.set-record {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.game-record {
+  font-size: 11px;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+@media (prefers-color-scheme: dark) {
+  .pool-cell {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .pool-cell.self {
+    background: rgba(255, 255, 255, 0.1);
+  }
+}
+
+/* --- Bracket tree view --- */
+.bracket-scroll {
+  overflow-x: auto;
+  min-width: 0;
+  padding: 16px;
+}
+
+.bracket-canvas {
+  position: relative;
+  width: max-content;
+  min-width: 100%;
+}
+
+.bracket-row {
+  display: flex;
+  gap: 36px;
+}
+
+.losers-row {
+  margin-top: 32px;
+  padding-top: 20px;
+  border-top: 1px dashed var(--panel-border);
+}
+
+.bracket-col {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  gap: 24px;
+  min-width: 200px;
+}
+
+.bracket-col h3 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.match-row {
+  position: relative;
+}
+
+.match-card {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+}
+
+.match-card:hover {
   border-color: #2366d1;
 }
 
-.set-head {
+.identifier-badge {
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: #2c2f36;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 999px;
+  z-index: 2;
+}
+
+.slot-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 6px;
-  font-size: 12px;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--panel-border);
 }
 
-.set-card p {
-  display: flex;
-  justify-content: space-between;
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.35;
+.slot-row:last-child {
+  border-bottom: none;
+}
+
+.slot-row.placeholder {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.slot-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slot-score {
+  min-width: 20px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.slot-row.winner {
+  background: rgba(35, 143, 79, 0.12);
+}
+
+.slot-row.winner .slot-name {
+  font-weight: 700;
+}
+
+.slot-row.winner .slot-score {
+  background: #238f4f;
+  color: #fff;
+}
+
+.connector-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 0;
+}
+
+.connector-svg path {
+  stroke: var(--panel-border);
+  stroke-width: 2;
+}
+
+@media (prefers-color-scheme: dark) {
+  .slot-score {
+    background: rgba(255, 255, 255, 0.12);
+  }
 }
 </style>

@@ -102,8 +102,29 @@ async function startPreview(deviceId) {
 
 async function goFullscreen() {
   if (!videoEl.value) return;
-  if (videoEl.value.requestFullscreen) {
-    await videoEl.value.requestFullscreen();
+  const el = videoEl.value;
+
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    if (document.exitFullscreen) {
+      await document.exitFullscreen();
+    } else if (document.webkitExitFullscreen) {
+      document.webkitExitFullscreen();
+    }
+    return;
+  }
+
+  try {
+    if (el.requestFullscreen) {
+      await el.requestFullscreen();
+    } else if (el.webkitRequestFullscreen) {
+      el.webkitRequestFullscreen();
+    } else if (el.webkitEnterFullscreen) {
+      el.webkitEnterFullscreen();
+    } else {
+      error.value = "Fullscreen is not supported in this environment.";
+    }
+  } catch (err) {
+    error.value = `Failed to enter fullscreen: ${err?.message || err}`;
   }
 }
 

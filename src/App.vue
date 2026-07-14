@@ -14,7 +14,9 @@ import { SMASH_ULTIMATE_CHARACTERS } from "./lib/characters";
 import {
   cloneEditorSet,
   createEditorSetFromTournamentSet,
+  currentGameCharacter,
   emptyEditorSet,
+  emptyGame,
   winnerEntrantId,
   winsFor,
 } from "./lib/set-utils";
@@ -29,7 +31,8 @@ const config = reactive({
 });
 
 const tournamentData = ref(null);
-const activeBucketId = ref("all-sets");
+const activeBucketId = ref("");
+const configPanelOpen = ref(true);
 
 const streamSet = ref(null);
 const quickReportSet = ref(null);
@@ -72,7 +75,7 @@ function applyBestOf(targetRef, value) {
       return;
     }
     while (set.games.length < bestOf) {
-      set.games.push({ winner: null });
+      set.games.push(emptyGame());
     }
   });
 }
@@ -87,12 +90,14 @@ function applyPlayerName(targetRef, payload) {
   });
 }
 
-function applyCharacter(targetRef, payload) {
+function applyGameCharacter(targetRef, payload) {
   updateEditorSet(targetRef, (set) => {
+    const game = set.games[payload.index];
+    if (!game) return;
     if (payload.player === 1) {
-      set.player1.character = payload.value;
+      game.player1Character = payload.value;
     } else {
-      set.player2.character = payload.value;
+      game.player2Character = payload.value;
     }
   });
 }
@@ -123,8 +128,8 @@ function onStreamPlayerName(payload) {
   applyPlayerName(streamSet, payload);
 }
 
-function onStreamCharacter(payload) {
-  applyCharacter(streamSet, payload);
+function onStreamGameCharacter(payload) {
+  applyGameCharacter(streamSet, payload);
 }
 
 function onStreamToggleWinner(payload) {
@@ -139,8 +144,8 @@ function onQuickPlayerName(payload) {
   applyPlayerName(quickReportSet, payload);
 }
 
-function onQuickCharacter(payload) {
-  applyCharacter(quickReportSet, payload);
+function onQuickGameCharacter(payload) {
+  applyGameCharacter(quickReportSet, payload);
 }
 
 function onQuickToggleWinner(payload) {
@@ -159,6 +164,10 @@ function onBucketChange(value) {
   activeBucketId.value = value;
 }
 
+function toggleConfigPanel() {
+  configPanelOpen.value = !configPanelOpen.value;
+}
+
 function closeQuickReport() {
   quickReportOpen.value = false;
   quickReportSet.value = null;
@@ -175,12 +184,12 @@ function overlayRequestFromEditorSet(editorSet) {
     bestOf: editorSet.bestOf === 3 ? 3 : 5,
     player1: {
       name: editorSet.player1.name || "Player 1",
-      character: editorSet.player1.character || null,
+      character: currentGameCharacter(editorSet, 1) || null,
       score: winsFor(editorSet, 1),
     },
     player2: {
       name: editorSet.player2.name || "Player 2",
-      character: editorSet.player2.character || null,
+      character: currentGameCharacter(editorSet, 2) || null,
       score: winsFor(editorSet, 2),
     },
   };
@@ -250,16 +259,20 @@ async function refreshTournament() {
     tournamentData.value = data;
 
     if (!data.buckets?.find((bucket) => bucket.id === activeBucketId.value)) {
-      activeBucketId.value = data.buckets?.[0]?.id || "all-sets";
+      activeBucketId.value = data.buckets?.[0]?.id || "";
     }
 
     if (streamSet.value?.setId) {
-      const allSets = data.buckets?.[0]?.sets || [];
+      const allSets = (data.buckets || []).flatMap((bucket) => bucket.sets || []);
       const matching = allSets.find((set) => set.id === streamSet.value.setId);
       if (matching) {
         const updated = createEditorSetFromTournamentSet(matching);
-        updated.player1.character = streamSet.value.player1.character;
-        updated.player2.character = streamSet.value.player2.character;
+        updated.games.forEach((game, index) => {
+          const previousGame = streamSet.value.games[index];
+          if (!previousGame) return;
+          game.player1Character = previousGame.player1Character;
+          game.player2Character = previousGame.player2Character;
+        });
         streamSet.value = updated;
       }
     }
@@ -364,6 +377,8 @@ onMounted(async () => {
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
 
+    configPanelOpen.value = !(config.apiToken && config.tournamentSlug);
+
     if (config.apiToken && config.tournamentSlug) {
       await refreshTournament();
     }
@@ -389,49 +404,57 @@ const showError = computed(() => Boolean(errorMessage.value));
 <template>
   <main class="app">
     <section class="config-panel">
-      <h1>Tournament Stream Manager (start.gg + Tauri)</h1>
-      <div class="config-grid">
-        <label>
-          start.gg API token
-          <input v-model="config.apiToken" type="password" placeholder="Bearer token" />
-        </label>
-
-        <label>
-          Tournament or event slug
-          <input
-            v-model="config.tournamentSlug"
-            type="text"
-            placeholder="tournament/your-tourney/event/ultimate-singles"
-          />
-        </label>
-
-        <label>
-          Stream output JSON path
-          <input
-            v-model="config.streamOutputPath"
-            type="text"
-            placeholder="/path/to/TSH/program_state.json"
-          />
-        </label>
-
-        <label>
-          Sets per event fetch
-          <input v-model.number="config.perPage" type="number" min="10" max="500" />
-        </label>
-
-        <label class="checkbox-field">
-          <input v-model="config.autoWriteOverlay" type="checkbox" />
-          Auto-write overlay on stream set changes
-        </label>
-      </div>
-
-      <div class="top-actions">
-        <button type="button" :disabled="savingConfig" @click="persistConfig">
-          {{ savingConfig ? "Saving…" : "Save Settings" }}
+      <header class="config-panel-header">
+        <h1>Tournament Stream Manager (start.gg + Tauri)</h1>
+        <button type="button" class="collapse-toggle" @click="toggleConfigPanel">
+          {{ configPanelOpen ? "Hide settings ▲" : "Show settings ▼" }}
         </button>
-        <button type="button" :disabled="loadingTournament" @click="refreshTournament">
-          {{ loadingTournament ? "Loading…" : "Refresh Tournament" }}
-        </button>
+      </header>
+
+      <div v-show="configPanelOpen">
+        <div class="config-grid">
+          <label>
+            start.gg API token
+            <input v-model="config.apiToken" type="password" placeholder="Bearer token" />
+          </label>
+
+          <label>
+            Tournament or event slug
+            <input
+              v-model="config.tournamentSlug"
+              type="text"
+              placeholder="tournament/your-tourney/event/ultimate-singles"
+            />
+          </label>
+
+          <label>
+            Stream output JSON path
+            <input
+              v-model="config.streamOutputPath"
+              type="text"
+              placeholder="/path/to/TSH/program_state.json"
+            />
+          </label>
+
+          <label>
+            Sets per event fetch
+            <input v-model.number="config.perPage" type="number" min="10" max="500" />
+          </label>
+
+          <label class="checkbox-field">
+            <input v-model="config.autoWriteOverlay" type="checkbox" />
+            Auto-write overlay on stream set changes
+          </label>
+        </div>
+
+        <div class="top-actions">
+          <button type="button" :disabled="savingConfig" @click="persistConfig">
+            {{ savingConfig ? "Saving…" : "Save Settings" }}
+          </button>
+          <button type="button" :disabled="loadingTournament" @click="refreshTournament">
+            {{ loadingTournament ? "Loading…" : "Refresh Tournament" }}
+          </button>
+        </div>
       </div>
 
       <p v-if="showStatus" class="message success">{{ statusMessage }}</p>
@@ -449,7 +472,7 @@ const showError = computed(() => Boolean(errorMessage.value));
         :writing-overlay="writingOverlay"
         @set-best-of="onStreamBestOf"
         @set-player-name="onStreamPlayerName"
-        @set-character="onStreamCharacter"
+        @set-game-character="onStreamGameCharacter"
         @toggle-game-winner="onStreamToggleWinner"
         @apply-overlay="writeOverlayFromStreamSet(false)"
         @submit="onStreamSubmit"
@@ -476,7 +499,7 @@ const showError = computed(() => Boolean(errorMessage.value));
           @close="closeQuickReport"
           @set-best-of="onQuickBestOf"
           @set-player-name="onQuickPlayerName"
-          @set-character="onQuickCharacter"
+          @set-game-character="onQuickGameCharacter"
           @toggle-game-winner="onQuickToggleWinner"
           @submit="onQuickSubmit"
         />
@@ -523,6 +546,7 @@ button:disabled {
 
 .app {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
   min-height: 100vh;
@@ -535,9 +559,22 @@ button:disabled {
   padding: 12px;
 }
 
+.config-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
 .config-panel h1 {
-  margin: 0 0 10px;
+  margin: 0;
   font-size: 18px;
+}
+
+.collapse-toggle {
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .config-grid {

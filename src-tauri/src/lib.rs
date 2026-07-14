@@ -2,7 +2,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -101,8 +101,11 @@ struct TournamentSet {
     id: u64,
     identifier: Option<String>,
     round_text: String,
+    round: i32,
     event_name: String,
     phase_name: Option<String>,
+    phase_group_id: Option<u64>,
+    phase_group_identifier: Option<String>,
     state: i32,
     winner_id: Option<u64>,
     best_of: u32,
@@ -116,6 +119,12 @@ struct EntrantSlot {
     entrant_id: Option<u64>,
     name: String,
     score: i32,
+    /// Where this slot's competitor comes from: "set", "seed", "bye", etc.
+    source_type: Option<String>,
+    /// The originating set ID when `source_type` is "set".
+    source_set_id: Option<u64>,
+    /// 1 = winner of the source set advances here, 2 = loser advances here.
+    source_placement: Option<i32>,
 }
 
 fn config_file_path() -> Result<PathBuf, String> {
@@ -152,6 +161,9 @@ fn default_slot(label: &str) -> EntrantSlot {
         entrant_id: None,
         name: label.to_string(),
         score: 0,
+        source_type: None,
+        source_set_id: None,
+        source_placement: None,
     }
 }
 
@@ -172,6 +184,20 @@ fn parse_slot(slot: Option<&Value>, fallback_name: &str) -> EntrantSlot {
         .and_then(parse_i32)
         .unwrap_or(0);
 
+    let source_type = slot
+        .get("prereqType")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|v| !v.is_empty());
+
+    let source_set_id = if source_type.as_deref() == Some("set") {
+        slot.get("prereqId").and_then(parse_u64)
+    } else {
+        None
+    };
+
+    let source_placement = slot.get("prereqPlacement").and_then(parse_i32);
+
     EntrantSlot {
         entrant_id,
         name: if name.is_empty() {
@@ -180,6 +206,9 @@ fn parse_slot(slot: Option<&Value>, fallback_name: &str) -> EntrantSlot {
             name
         },
         score,
+        source_type,
+        source_set_id,
+        source_placement,
     }
 }
 
@@ -371,10 +400,21 @@ fn parse_set_nodes(event_name: &str, nodes: &[Value]) -> Vec<TournamentSet> {
             }
         };
 
-        let phase_name = node
-            .get("phaseGroup")
+        let phase_group = node.get("phaseGroup");
+
+        let phase_name = phase_group
             .and_then(|pg| pg.get("phase"))
             .and_then(|phase| phase.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|v| !v.is_empty());
+
+        let phase_group_id = phase_group
+            .and_then(|pg| pg.get("id"))
+            .and_then(parse_u64);
+
+        let phase_group_identifier = phase_group
+            .and_then(|pg| pg.get("displayIdentifier"))
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|v| !v.is_empty());
@@ -390,6 +430,7 @@ fn parse_set_nodes(event_name: &str, nodes: &[Value]) -> Vec<TournamentSet> {
 
         let state = parse_i32(node.get("state").unwrap_or(&Value::Null)).unwrap_or(0);
         let winner_id = parse_u64(node.get("winnerId").unwrap_or(&Value::Null));
+        let round = parse_i32(node.get("round").unwrap_or(&Value::Null)).unwrap_or(0);
 
         let max_score = player1.score.max(player2.score);
         let best_of = if max_score >= 3 { 5 } else { 3 };
@@ -398,8 +439,11 @@ fn parse_set_nodes(event_name: &str, nodes: &[Value]) -> Vec<TournamentSet> {
             id: set_id,
             identifier,
             round_text,
+            round,
             event_name: event_label.clone(),
             phase_name,
+            phase_group_id,
+            phase_group_identifier,
             state,
             winner_id,
             best_of,
@@ -411,10 +455,28 @@ fn parse_set_nodes(event_name: &str, nodes: &[Value]) -> Vec<TournamentSet> {
     out
 }
 
+/// One tab's worth of sets. Grouped by phase group (i.e. one bucket per
+/// pool) rather than by phase, so a "Pools" phase with several pools becomes
+/// several tabs instead of one tab with everything mixed together.
+struct GroupedBucket {
+    key: String,
+    sets: Vec<TournamentSet>,
+}
+
+fn group_key(set: &TournamentSet) -> String {
+    if let Some(group_id) = set.phase_group_id {
+        format!("pg:{group_id}")
+    } else if let Some(phase) = &set.phase_name {
+        format!("ep:{}::{}", set.event_name, phase)
+    } else {
+        format!("e:{}", set.event_name)
+    }
+}
+
 fn push_sets_to_buckets(
     sets: Vec<TournamentSet>,
     all_sets: &mut Vec<TournamentSet>,
-    grouped: &mut BTreeMap<String, Vec<TournamentSet>>,
+    grouped: &mut Vec<GroupedBucket>,
     seen_set_ids: &mut HashSet<u64>,
 ) {
     for set in sets {
@@ -424,13 +486,14 @@ fn push_sets_to_buckets(
 
         all_sets.push(set.clone());
 
-        let bucket_name = if let Some(phase) = &set.phase_name {
-            format!("{} - {}", set.event_name, phase)
-        } else {
-            set.event_name.clone()
-        };
-
-        grouped.entry(bucket_name).or_default().push(set);
+        let key = group_key(&set);
+        match grouped.iter_mut().find(|bucket| bucket.key == key) {
+            Some(bucket) => bucket.sets.push(set),
+            None => grouped.push(GroupedBucket {
+                key,
+                sets: vec![set],
+            }),
+        }
     }
 }
 
@@ -438,28 +501,57 @@ fn build_tournament_data(
     tournament_id: Option<u64>,
     tournament_name: String,
     slug: &str,
-    mut grouped: BTreeMap<String, Vec<TournamentSet>>,
+    grouped: Vec<GroupedBucket>,
     all_sets: Vec<TournamentSet>,
 ) -> TournamentData {
-    let mut buckets = Vec::new();
-    buckets.push(SetBucket {
-        id: "all-sets".to_string(),
-        name: "All Sets".to_string(),
-        sets: all_sets,
-    });
+    let total_sets = all_sets.len();
 
-    for (name, sets) in grouped.iter_mut() {
-        buckets.push(SetBucket {
-            id: normalize_bucket_id(name),
-            name: name.to_string(),
-            sets: sets.clone(),
-        });
+    // Count how many phase groups share the same (event, phase) so a
+    // single-group phase (or a bracket, which normally has just one group)
+    // doesn't get a redundant "Pool N" suffix - only actual multi-pool
+    // phases do.
+    let mut phase_group_counts: HashMap<(String, String), usize> = HashMap::new();
+    for bucket in &grouped {
+        if let Some(first) = bucket.sets.first() {
+            let phase = first.phase_name.clone().unwrap_or_default();
+            *phase_group_counts
+                .entry((first.event_name.clone(), phase))
+                .or_insert(0) += 1;
+        }
     }
 
-    let total_sets = buckets
-        .first()
-        .map(|bucket| bucket.sets.len())
-        .unwrap_or_default();
+    let mut buckets = Vec::new();
+    for bucket in grouped {
+        let Some(first) = bucket.sets.first() else {
+            continue;
+        };
+
+        let phase = first.phase_name.clone();
+        let base_name = if let Some(phase) = &phase {
+            format!("{} - {}", first.event_name, phase)
+        } else {
+            first.event_name.clone()
+        };
+
+        let phase_key = (first.event_name.clone(), phase.clone().unwrap_or_default());
+        let group_count = phase_group_counts.get(&phase_key).copied().unwrap_or(1);
+
+        let name = if group_count > 1 {
+            let pool_label = first
+                .phase_group_identifier
+                .clone()
+                .unwrap_or_else(|| "?".to_string());
+            format!("{base_name} Pool {pool_label}")
+        } else {
+            base_name
+        };
+
+        buckets.push(SetBucket {
+            id: normalize_bucket_id(&bucket.key),
+            name,
+            sets: bucket.sets,
+        });
+    }
 
     TournamentData {
         tournament_id,
@@ -492,7 +584,7 @@ fn parse_tournament_payload(data: &Value, slug: &str) -> Result<TournamentData, 
         .and_then(Value::as_array)
         .ok_or_else(|| "start.gg response missing events array".to_string())?;
 
-    let mut grouped: BTreeMap<String, Vec<TournamentSet>> = BTreeMap::new();
+    let mut grouped: Vec<GroupedBucket> = Vec::new();
     let mut all_sets: Vec<TournamentSet> = Vec::new();
     let mut seen_set_ids: HashSet<u64> = HashSet::new();
 
@@ -540,7 +632,7 @@ fn parse_event_payload(data: &Value, slug: &str) -> Result<TournamentData, Strin
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
-    let mut grouped: BTreeMap<String, Vec<TournamentSet>> = BTreeMap::new();
+    let mut grouped: Vec<GroupedBucket> = Vec::new();
     let mut all_sets: Vec<TournamentSet> = Vec::new();
     let mut seen_set_ids: HashSet<u64> = HashSet::new();
 
@@ -596,14 +688,20 @@ async fn fetch_tournament_payload(
                   fullRoundText
                   state
                   winnerId
+                  round
                   phaseGroup {
                     id
+                    displayIdentifier
                     phase {
                       id
                       name
                     }
                   }
                   slots {
+                    slotIndex
+                    prereqType
+                    prereqId
+                    prereqPlacement
                     entrant {
                       id
                       name
@@ -647,14 +745,20 @@ async fn fetch_tournament_payload(
                   fullRoundText
                   state
                   winnerId
+                  round
                   phaseGroup {
                     id
+                    displayIdentifier
                     phase {
                       id
                       name
                     }
                   }
                   slots {
+                    slotIndex
+                    prereqType
+                    prereqId
+                    prereqPlacement
                     entrant {
                       id
                       name
@@ -689,7 +793,12 @@ async fn fetch_tournament_payload(
                   fullRoundText
                   state
                   winnerId
+                  round
                   slots {
+                    slotIndex
+                    prereqType
+                    prereqId
+                    prereqPlacement
                     entrant {
                       id
                       name
@@ -756,14 +865,20 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 fullRoundText
                 state
                 winnerId
+                round
                 phaseGroup {
                   id
+                  displayIdentifier
                   phase {
                     id
                     name
                   }
                 }
                 slots {
+                  slotIndex
+                  prereqType
+                  prereqId
+                  prereqPlacement
                   entrant {
                     id
                     name
@@ -787,14 +902,20 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                   fullRoundText
                   state
                   winnerId
+                  round
                   phaseGroup {
                     id
+                    displayIdentifier
                     phase {
                       id
                       name
                     }
                   }
                   slots {
+                    slotIndex
+                    prereqType
+                    prereqId
+                    prereqPlacement
                     entrant {
                       id
                       name
@@ -839,14 +960,20 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 fullRoundText
                 state
                 winnerId
+                round
                 phaseGroup {
                   id
+                  displayIdentifier
                   phase {
                     id
                     name
                   }
                 }
                 slots {
+                  slotIndex
+                  prereqType
+                  prereqId
+                  prereqPlacement
                   entrant {
                     id
                     name
@@ -879,14 +1006,20 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                   fullRoundText
                   state
                   winnerId
+                  round
                   phaseGroup {
                     id
+                    displayIdentifier
                     phase {
                       id
                       name
                     }
                   }
                   slots {
+                    slotIndex
+                    prereqType
+                    prereqId
+                    prereqPlacement
                     entrant {
                       id
                       name
@@ -922,7 +1055,12 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 fullRoundText
                 state
                 winnerId
+                round
                 slots {
+                  slotIndex
+                  prereqType
+                  prereqId
+                  prereqPlacement
                   entrant {
                     id
                     name

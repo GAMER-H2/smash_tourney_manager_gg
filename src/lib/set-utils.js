@@ -1,3 +1,7 @@
+export function emptyGame() {
+  return { winner: null, player1Character: "", player2Character: "" };
+}
+
 export function emptyEditorSet() {
   return {
     setId: null,
@@ -9,14 +13,12 @@ export function emptyEditorSet() {
     player1: {
       entrantId: null,
       name: "Player 1",
-      character: "",
     },
     player2: {
       entrantId: null,
       name: "Player 2",
-      character: "",
     },
-    games: Array.from({ length: 5 }, () => ({ winner: null })),
+    games: Array.from({ length: 5 }, emptyGame),
   };
 }
 
@@ -31,7 +33,7 @@ export function createEditorSetFromTournamentSet(set) {
   const p1Score = Math.max(0, Number(set?.player1?.score ?? 0));
   const p2Score = Math.max(0, Number(set?.player2?.score ?? 0));
 
-  const games = Array.from({ length: bestOf }, () => ({ winner: null }));
+  const games = Array.from({ length: bestOf }, emptyGame);
   let index = 0;
 
   for (let i = 0; i < Math.min(p1Score, targetWins); i += 1) {
@@ -55,12 +57,10 @@ export function createEditorSetFromTournamentSet(set) {
     player1: {
       entrantId: set.player1?.entrantId ?? null,
       name: set.player1?.name || "Player 1",
-      character: "",
     },
     player2: {
       entrantId: set.player2?.entrantId ?? null,
       name: set.player2?.name || "Player 2",
-      character: "",
     },
     games,
   };
@@ -72,6 +72,22 @@ export function winsFor(editorSet, player) {
     (acc, game) => acc + (game?.winner === player ? 1 : 0),
     0,
   );
+}
+
+// The game whose character selection should represent the set "right now":
+// the next game without a decided winner, or the last game once the set is over.
+export function currentGameIndex(editorSet) {
+  const games = editorSet?.games ?? [];
+  if (!games.length) return -1;
+  const nextUnplayed = games.findIndex((game) => !game?.winner);
+  return nextUnplayed === -1 ? games.length - 1 : nextUnplayed;
+}
+
+export function currentGameCharacter(editorSet, player) {
+  const index = currentGameIndex(editorSet);
+  if (index === -1) return "";
+  const game = editorSet.games[index];
+  return (player === 1 ? game?.player1Character : game?.player2Character) || "";
 }
 
 export function winnerEntrantId(editorSet) {
