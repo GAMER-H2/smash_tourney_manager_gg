@@ -19,3 +19,15 @@ export async function reportSetResult(request) {
 export async function writeStreamOverlay(request) {
   return invoke("write_stream_overlay", { request });
 }
+
+export async function listCaptureTargets() {
+  return invoke("list_capture_targets");
+}
+
+export async function startWindowCapture(targetId, targetKind) {
+  return invoke("start_window_capture", { targetId, targetKind });
+}
+
+export async function stopWindowCapture() {
+  return invoke("stop_window_capture");
+}

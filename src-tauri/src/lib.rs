@@ -1,11 +1,19 @@
+use base64::Engine;
 use chrono::Utc;
+use image::codecs::jpeg::JpegEncoder;
+use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
+use tauri::Emitter;
 
 const START_GG_GQL_URL: &str = "https://api.start.gg/gql/alpha";
 
@@ -18,6 +26,10 @@ struct AppConfig {
     preferred_camera_id: Option<String>,
     per_page: u32,
     auto_write_overlay: bool,
+    #[serde(default)]
+    preferred_capture_mode: String,
+    #[serde(default)]
+    preferred_capture_window_title: String,
 }
 
 impl Default for AppConfig {
@@ -29,6 +41,8 @@ impl Default for AppConfig {
             preferred_camera_id: None,
             per_page: 128,
             auto_write_overlay: true,
+            preferred_capture_mode: "webcam".to_string(),
+            preferred_capture_window_title: String::new(),
         }
     }
 }
@@ -1339,16 +1353,189 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
         .map_err(|e| format!("Failed to write overlay file '{}': {e}", path.display()))
 }
 
+// --- Window / display capture ---
+// Lets the app show a live preview of another window (e.g. an OBS Projector)
+// without needing a virtual-camera driver, which requires admin rights to
+// install. Frames are captured via the OS's native screen-capture API
+// (Windows.Graphics.Capture / ScreenCaptureKit / PipeWire), JPEG-encoded, and
+// pushed to the frontend as base64 data URLs over a Tauri event.
+
+struct CaptureState {
+    generation: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureTargetInfo {
+    id: u32,
+    title: String,
+    kind: String,
+}
+
+#[tauri::command]
+fn list_capture_targets() -> Result<Vec<CaptureTargetInfo>, String> {
+    if !scap::is_supported() {
+        return Err("Screen capture is not supported on this system.".to_string());
+    }
+
+    // get_all_targets() panics internally (rather than erroring) if screen
+    // recording permission hasn't been granted, so this check must happen
+    // first - it's not just an optimization.
+    if !scap::has_permission() && !scap::request_permission() {
+        return Err(
+            "Screen recording permission is required to list capture targets. Check your OS privacy/security settings and try again."
+                .to_string(),
+        );
+    }
+
+    Ok(scap::get_all_targets()
+        .into_iter()
+        .map(|target| match target {
+            scap::Target::Window(window) => CaptureTargetInfo {
+                id: window.id,
+                title: if window.title.trim().is_empty() {
+                    format!("Window {}", window.id)
+                } else {
+                    window.title
+                },
+                kind: "window".to_string(),
+            },
+            scap::Target::Display(display) => CaptureTargetInfo {
+                id: display.id,
+                title: if display.title.trim().is_empty() {
+                    format!("Display {}", display.id)
+                } else {
+                    display.title
+                },
+                kind: "display".to_string(),
+            },
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn stop_window_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
+    // Bumping the generation tells the currently-running capture thread (if
+    // any) that it's stale, so it winds itself down on its next frame.
+    state.generation.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+fn start_window_capture(
+    app: tauri::AppHandle,
+    state: tauri::State<CaptureState>,
+    target_id: u32,
+    target_kind: String,
+) -> Result<(), String> {
+    if !scap::is_supported() {
+        return Err("Screen capture is not supported on this system.".to_string());
+    }
+
+    if !scap::has_permission() && !scap::request_permission() {
+        return Err(
+            "Screen recording permission was not granted. Check your OS privacy settings."
+                .to_string(),
+        );
+    }
+
+    let target = scap::get_all_targets()
+        .into_iter()
+        .find(|target| match target {
+            scap::Target::Window(window) => target_kind == "window" && window.id == target_id,
+            scap::Target::Display(display) => {
+                target_kind == "display" && display.id == target_id
+            }
+        })
+        .ok_or_else(|| "Capture target no longer available; refresh and try again.".to_string())?;
+
+    let options = scap::capturer::Options {
+        fps: 15,
+        show_cursor: true,
+        show_highlight: false,
+        target: Some(target),
+        output_type: scap::frame::FrameType::BGRAFrame,
+        ..Default::default()
+    };
+
+    let mut capturer =
+        scap::capturer::Capturer::build(options).map_err(|e| format!("Failed to start capture: {e}"))?;
+
+    // Invalidate any previous capture thread and claim the new generation.
+    let my_generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let generation = state.generation.clone();
+
+    std::thread::spawn(move || {
+        capturer.start_capture();
+
+        loop {
+            if generation.load(Ordering::SeqCst) != my_generation {
+                break;
+            }
+
+            let frame = match capturer.get_next_frame() {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            if generation.load(Ordering::SeqCst) != my_generation {
+                break;
+            }
+
+            let scap::frame::Frame::BGRA(bgra) = frame else {
+                continue;
+            };
+
+            if bgra.width <= 0 || bgra.height <= 0 {
+                continue;
+            }
+
+            let width = bgra.width as u32;
+            let height = bgra.height as u32;
+            let rgb = scap::frame::convert_bgra_to_rgb(bgra.data);
+
+            let mut jpeg_bytes: Vec<u8> = Vec::new();
+            let encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 70);
+            if encoder
+                .write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)
+                .is_err()
+            {
+                continue;
+            }
+
+            let data_url = format!(
+                "data:image/jpeg;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes)
+            );
+
+            let _ = app.emit(
+                "capture-frame",
+                json!({ "dataUrl": data_url, "width": width, "height": height }),
+            );
+        }
+
+        capturer.stop_capture();
+    });
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(CaptureState {
+            generation: Arc::new(AtomicU64::new(0)),
+        })
         .invoke_handler(tauri::generate_handler![
             load_app_config,
             save_app_config,
             fetch_tournament_state,
             report_set_result,
             write_stream_overlay,
+            list_capture_targets,
+            start_window_capture,
+            stop_window_capture,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
