@@ -28,8 +28,6 @@ const config = reactive({
   preferredCameraId: "",
   perPage: 128,
   autoWriteOverlay: true,
-  captureMode: "webcam",
-  preferredCaptureWindowTitle: "",
 });
 
 const tournamentData = ref(null);
@@ -297,8 +295,6 @@ async function persistConfig() {
       preferredCameraId: config.preferredCameraId || null,
       perPage: Number(config.perPage) || 128,
       autoWriteOverlay: config.autoWriteOverlay,
-      preferredCaptureMode: config.captureMode,
-      preferredCaptureWindowTitle: config.preferredCaptureWindowTitle,
     });
     setSuccess("Settings saved.");
   } catch (err) {
@@ -380,8 +376,6 @@ onMounted(async () => {
     config.preferredCameraId = loaded.preferredCameraId || "";
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
-    config.captureMode = loaded.preferredCaptureMode || "webcam";
-    config.preferredCaptureWindowTitle = loaded.preferredCaptureWindowTitle || "";
 
     configPanelOpen.value = !(config.apiToken && config.tournamentSlug);
 
@@ -468,11 +462,7 @@ const showError = computed(() => Boolean(errorMessage.value));
     </section>
 
     <section class="top-grid">
-      <WebcamPanel
-        v-model:camera-id="config.preferredCameraId"
-        v-model:mode="config.captureMode"
-        v-model:capture-window-title="config.preferredCaptureWindowTitle"
-      />
+      <WebcamPanel v-model:camera-id="config.preferredCameraId" />
 
       <SetEditor
         title="On Stream Set"
