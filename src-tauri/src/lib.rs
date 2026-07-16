@@ -1339,10 +1339,117 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
         .map_err(|e| format!("Failed to write overlay file '{}': {e}", path.display()))
 }
 
+// gst-plugin-pipewire hides *every* plain V4L2 device (gstv4l2deviceprovider),
+// including ones PipeWire itself never exposes (e.g. v4l2loopback virtual
+// cameras), as soon as it sees any PipeWire node backed by a real /dev/video*
+// device. On top of that, WebKitGTK's getUserMedia negotiates a DMABuf
+// (zero-copy) format through pipewiresrc that can fail caps fixation for some
+// webcams, leaving the video track blank. Excluding the plugin from
+// GStreamer's scan restores every plain V4L2 camera and a working (if
+// non-zero-copy) capture pipeline. Must run before GStreamer's registry is
+// first scanned, i.e. before any webview/WebKitWebProcess is created.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn disable_gstreamer_pipewire_plugin() {
+    use std::{fs, os::unix::fs::symlink, path::Path};
+
+    let Some(source_dir) = ["/usr/lib/gstreamer-1.0", "/usr/lib64/gstreamer-1.0"]
+        .into_iter()
+        .map(Path::new)
+        .find(|dir| dir.join("libgstpipewire.so").exists())
+    else {
+        return;
+    };
+
+    // Reused across runs (not per-PID): GStreamer skips rescanning a registry
+    // whose backing plugin files haven't changed, which keeps startup fast.
+    // A fresh path every launch would force a full rescan on every start and
+    // race with the webview's near-immediate camera enumeration on mount.
+    let Ok(mut filtered_dir) = config_file_path() else {
+        return;
+    };
+    filtered_dir.pop();
+    filtered_dir.push("gst-plugins");
+
+    let Ok(entries) = fs::create_dir_all(&filtered_dir).and_then(|_| fs::read_dir(source_dir)) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("so")
+            || path.file_name().and_then(|n| n.to_str()) == Some("libgstpipewire.so")
+        {
+            continue;
+        }
+        let _ = symlink(&path, filtered_dir.join(entry.file_name()));
+    }
+
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &filtered_dir);
+    std::env::set_var("GST_REGISTRY", filtered_dir.join("registry.bin"));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    disable_gstreamer_pipewire_plugin();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|_app| {
+            // WebKitGTK (Tauri's Linux webview) denies getUserMedia by default
+            // unless the host app answers its "permission-request" signal itself;
+            // wry doesn't do this for us on Linux like it does on Windows/Android.
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            {
+                use tauri::Manager;
+
+                if let Some(main_webview) = _app.get_webview_window("main") {
+                    main_webview.with_webview(|webview| {
+                        use webkit2gtk::{
+                            glib::Cast, PermissionRequestExt, SettingsExt, UserMediaPermissionRequest,
+                            WebViewExt,
+                        };
+
+                        // Surfaces the webview's console.log/console.error in this
+                        // process's stdout, since WebKitGTK doesn't do that by
+                        // default the way Chromium/devtools consoles do.
+                        if let Some(settings) = webview.inner().settings() {
+                            settings.set_enable_write_console_messages_to_stdout(true);
+                        }
+
+                        webview.inner().connect_permission_request(|_, request| {
+                            match request.downcast_ref::<UserMediaPermissionRequest>() {
+                                Some(request) => {
+                                    request.allow();
+                                    true
+                                }
+                                None => false,
+                            }
+                        });
+                    })?;
+                }
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_app_config,
             save_app_config,

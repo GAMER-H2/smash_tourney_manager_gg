@@ -33,6 +33,7 @@ const config = reactive({
 const tournamentData = ref(null);
 const activeBucketId = ref("");
 const configPanelOpen = ref(true);
+const configLoaded = ref(false);
 
 const streamSet = ref(null);
 const quickReportSet = ref(null);
@@ -376,6 +377,7 @@ onMounted(async () => {
     config.preferredCameraId = loaded.preferredCameraId || "";
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
+    configLoaded.value = true;
 
     configPanelOpen.value = !(config.apiToken && config.tournamentSlug);
 
@@ -384,6 +386,7 @@ onMounted(async () => {
     }
   } catch (err) {
     setError(`Could not load saved settings: ${String(err)}`);
+    configLoaded.value = true;
   }
 
   if (!streamSet.value) {
@@ -462,7 +465,7 @@ const showError = computed(() => Boolean(errorMessage.value));
     </section>
 
     <section class="top-grid">
-      <WebcamPanel v-model:camera-id="config.preferredCameraId" />
+      <WebcamPanel v-if="configLoaded" v-model:camera-id="config.preferredCameraId" />
 
       <SetEditor
         title="On Stream Set"
@@ -512,6 +515,7 @@ const showError = computed(() => Boolean(errorMessage.value));
 :root {
   --panel-bg: #ffffff;
   --panel-border: #d9d9de;
+  color-scheme: light;
 }
 
 * {
@@ -651,6 +655,7 @@ button:disabled {
   :root {
     --panel-bg: #1f2025;
     --panel-border: #373a43;
+    color-scheme: dark;
   }
 
   body {
