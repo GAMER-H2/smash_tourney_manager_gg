@@ -66,6 +66,15 @@ export function createEditorSetFromTournamentSet(set) {
   };
 }
 
+// A game can only be reported once every earlier game in the set already has
+// a winner, so "the next unreported game" (currentGameIndex) is always
+// unambiguous regardless of what order rows were clicked in.
+export function canReportGame(editorSet, index) {
+  const games = editorSet?.games ?? [];
+  if (index <= 0) return true;
+  return Boolean(games[index - 1]?.winner);
+}
+
 export function winsFor(editorSet, player) {
   if (!editorSet?.games) return 0;
   return editorSet.games.reduce(

@@ -10,8 +10,9 @@ import {
   saveConfig,
   writeStreamOverlay,
 } from "./lib/api";
-import { SMASH_ULTIMATE_CHARACTERS } from "./lib/characters";
+import { characterIconFile, SMASH_ULTIMATE_CHARACTERS } from "./lib/characters";
 import {
+  canReportGame,
   cloneEditorSet,
   createEditorSetFromTournamentSet,
   currentGameCharacter,
@@ -95,10 +96,15 @@ function applyGameCharacter(targetRef, payload) {
   updateEditorSet(targetRef, (set) => {
     const game = set.games[payload.index];
     if (!game) return;
-    if (payload.player === 1) {
-      game.player1Character = payload.value;
-    } else {
-      game.player2Character = payload.value;
+    const key = payload.player === 1 ? "player1Character" : "player2Character";
+    game[key] = payload.value;
+
+    // Carry the pick forward: later games default to the same character
+    // until someone explicitly sets a different one for that game.
+    for (let i = payload.index + 1; i < set.games.length; i += 1) {
+      if (!set.games[i][key]) {
+        set.games[i][key] = payload.value;
+      }
     }
   });
 }
@@ -107,7 +113,32 @@ function toggleWinner(targetRef, payload) {
   updateEditorSet(targetRef, (set) => {
     if (payload.index < 0 || payload.index >= set.games.length) return;
     const current = set.games[payload.index]?.winner;
-    set.games[payload.index].winner = current === payload.winner ? null : payload.winner;
+    const next = current === payload.winner ? null : payload.winner;
+
+    // Games must be reported in order, so "the next unreported game" always
+    // matches whichever row is actually being played on stream.
+    if (current === null && next !== null && !canReportGame(set, payload.index)) {
+      return;
+    }
+
+    set.games[payload.index].winner = next;
+
+    if (next === null) {
+      for (let i = payload.index + 1; i < set.games.length; i += 1) {
+        set.games[i].winner = null;
+      }
+    }
+  });
+}
+
+function swapPlayers(targetRef) {
+  updateEditorSet(targetRef, (set) => {
+    [set.player1, set.player2] = [set.player2, set.player1];
+    set.games = set.games.map((game) => ({
+      winner: game.winner === 1 ? 2 : game.winner === 2 ? 1 : null,
+      player1Character: game.player2Character,
+      player2Character: game.player1Character,
+    }));
   });
 }
 
@@ -135,6 +166,10 @@ function onStreamGameCharacter(payload) {
 
 function onStreamToggleWinner(payload) {
   toggleWinner(streamSet, payload);
+}
+
+function onStreamSwapPlayers() {
+  swapPlayers(streamSet);
 }
 
 function onQuickBestOf(value) {
@@ -186,11 +221,13 @@ function overlayRequestFromEditorSet(editorSet) {
     player1: {
       name: editorSet.player1.name || "Player 1",
       character: currentGameCharacter(editorSet, 1) || null,
+      characterIcon: characterIconFile(currentGameCharacter(editorSet, 1)),
       score: winsFor(editorSet, 1),
     },
     player2: {
       name: editorSet.player2.name || "Player 2",
       character: currentGameCharacter(editorSet, 2) || null,
+      characterIcon: characterIconFile(currentGameCharacter(editorSet, 2)),
       score: winsFor(editorSet, 2),
     },
   };
@@ -473,10 +510,12 @@ const showError = computed(() => Boolean(errorMessage.value));
         :characters="SMASH_ULTIMATE_CHARACTERS"
         :submitting="submittingStream"
         :writing-overlay="writingOverlay"
+        :allow-swap="true"
         @set-best-of="onStreamBestOf"
         @set-player-name="onStreamPlayerName"
         @set-game-character="onStreamGameCharacter"
         @toggle-game-winner="onStreamToggleWinner"
+        @swap-players="onStreamSwapPlayers"
         @apply-overlay="writeOverlayFromStreamSet(false)"
         @submit="onStreamSubmit"
       />

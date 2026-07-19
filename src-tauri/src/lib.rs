@@ -9,6 +9,14 @@ use std::{
 
 const START_GG_GQL_URL: &str = "https://api.start.gg/gql/alpha";
 
+// Bundled at compile time so the character icons this app already ships in
+// its own UI (public/character-icons) can also be staged next to
+// program_state.json for TSH's layouts to render on stream - those layouts
+// load images by relative path from disk and can't reach into this app's
+// own webview assets.
+static CHARACTER_ICONS: include_dir::Dir =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../public/character-icons");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppConfig {
@@ -73,6 +81,7 @@ struct WriteOverlayRequest {
 struct OverlayPlayer {
     name: String,
     character: Option<String>,
+    character_icon: Option<String>,
     score: u32,
 }
 
@@ -1281,50 +1290,79 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
         }
     }
 
-    let payload = json!({
-        "lastUpdated": Utc::now().to_rfc3339(),
-        "set": {
-            "roundText": request.round_text,
-            "eventName": request.event_name,
-            "bestOf": request.best_of,
-            "player1": {
-                "name": request.player1.name,
-                "character": request.player1.character.clone().unwrap_or_default(),
-                "score": request.player1.score,
-            },
-            "player2": {
-                "name": request.player2.name,
-                "character": request.player2.character.clone().unwrap_or_default(),
-                "score": request.player2.score,
+    // Character portraits: TSH's CharacterDisplay() (include/assetUtils.js)
+    // requires `player.character` to be an object keyed by arbitrary ids,
+    // each with a `codename` and an `assets` map of `{ asset: "<path relative
+    // to the TSH root>" }`; entries without a codename are skipped entirely.
+    // The icon itself has to physically exist under the TSH out/ directory
+    // (the layout loads it via a "../../" relative file path), so stage the
+    // bundled PNG there the first time each character is used.
+    let out_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+
+    let character_asset = |icon: Option<&str>| -> Option<Value> {
+        let slug = icon?;
+        let out_dir = out_dir?;
+        let file_name = format!("{slug}.png");
+        let source = CHARACTER_ICONS.get_file(&file_name)?;
+
+        let icons_dir = out_dir.join("character-icons");
+        let dest = icons_dir.join(&file_name);
+        if !dest.exists() {
+            fs::create_dir_all(&icons_dir).ok()?;
+            fs::write(&dest, source.contents()).ok()?;
+        }
+
+        Some(json!({
+            "0": {
+                "codename": slug,
+                "assets": {
+                    "portrait": {
+                        "asset": format!("out/character-icons/{file_name}"),
+                    }
+                }
             }
+        }))
+    };
+
+    // Mirrors the schema TSH's own StateManager writes to out/program_state.json
+    // (score keyed by scoreboard number, team/player nesting, tournamentInfo at
+    // the top level, country/state as objects). TSH's layout JS dereferences
+    // `player.country.asset` and `player.state.asset` unconditionally, so those
+    // must be objects (even empty ones) rather than missing or a bare string,
+    // or the layout's Update() throws and the overlay stops rendering entirely.
+    let player_payload = |player: &OverlayPlayer| {
+        json!({
+            "name": player.name,
+            "characterName": player.character.clone().unwrap_or_default(),
+            "character": character_asset(player.character_icon.as_deref()).unwrap_or(json!({})),
+            "country": {},
+            "state": {},
+            "pronoun": "",
+            "twitter": "",
+        })
+    };
+
+    let payload = json!({
+        "timestamp": Utc::now().timestamp_millis() as f64 / 1000.0,
+        "tournamentInfo": {
+            "tournamentName": request.tournament_name,
         },
         "score": {
-            "best_of": request.best_of,
-            "match": request.round_text,
-            "phase": request.event_name,
-            "tournamentName": request.tournament_name,
-            "team": {
-                "1": {
-                    "score": request.player1.score,
-                    "player": {
-                        "1": {
-                            "name": request.player1.name,
-                            "character": request.player1.character.clone().unwrap_or_default(),
-                            "country": "",
-                            "pronoun": "",
-                            "twitter": ""
+            "1": {
+                "best_of": request.best_of,
+                "match": request.round_text,
+                "phase": request.event_name,
+                "team": {
+                    "1": {
+                        "score": request.player1.score,
+                        "player": {
+                            "1": player_payload(&request.player1),
                         }
-                    }
-                },
-                "2": {
-                    "score": request.player2.score,
-                    "player": {
-                        "1": {
-                            "name": request.player2.name,
-                            "character": request.player2.character.clone().unwrap_or_default(),
-                            "country": "",
-                            "pronoun": "",
-                            "twitter": ""
+                    },
+                    "2": {
+                        "score": request.player2.score,
+                        "player": {
+                            "1": player_payload(&request.player2),
                         }
                     }
                 }
@@ -1337,6 +1375,11 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
 
     fs::write(path, serialized)
         .map_err(|e| format!("Failed to write overlay file '{}': {e}", path.display()))
+}
+
+#[tauri::command]
+fn get_platform() -> &'static str {
+    std::env::consts::OS
 }
 
 // gst-plugin-pipewire hides *every* plain V4L2 device (gstv4l2deviceprovider),
@@ -1424,16 +1467,8 @@ pub fn run() {
                 if let Some(main_webview) = _app.get_webview_window("main") {
                     main_webview.with_webview(|webview| {
                         use webkit2gtk::{
-                            glib::Cast, PermissionRequestExt, SettingsExt, UserMediaPermissionRequest,
-                            WebViewExt,
+                            glib::Cast, PermissionRequestExt, UserMediaPermissionRequest, WebViewExt,
                         };
-
-                        // Surfaces the webview's console.log/console.error in this
-                        // process's stdout, since WebKitGTK doesn't do that by
-                        // default the way Chromium/devtools consoles do.
-                        if let Some(settings) = webview.inner().settings() {
-                            settings.set_enable_write_console_messages_to_stdout(true);
-                        }
 
                         webview.inner().connect_permission_request(|_, request| {
                             match request.downcast_ref::<UserMediaPermissionRequest>() {
@@ -1456,6 +1491,7 @@ pub fn run() {
             fetch_tournament_state,
             report_set_result,
             write_stream_overlay,
+            get_platform,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

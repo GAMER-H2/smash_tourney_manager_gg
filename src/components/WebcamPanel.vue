@@ -1,5 +1,6 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { getPlatform } from "../lib/api";
 
 const props = defineProps({
   cameraId: {
@@ -15,6 +16,7 @@ const videoEl = ref(null);
 const stream = ref(null);
 const error = ref("");
 const loading = ref(false);
+const isLinux = ref(false);
 
 function stopStream() {
   if (!stream.value) return;
@@ -45,18 +47,8 @@ async function refreshCameras() {
   loading.value = true;
   error.value = "";
 
-  console.log("[webcam] refreshCameras start, current cameraId =", props.cameraId);
-
   try {
-    // Only probe-and-immediately-close a throwaway stream when we don't
-    // already know which camera to open. When we do (a persisted
-    // selection), startPreview below grants permission itself; doing both
-    // back-to-back closes and reopens the same physical device in quick
-    // succession, which can transiently fail on some camera stacks and is
-    // why the last-used camera used to need a manual reselect to appear.
-    if (!props.cameraId) {
-      await requestPermissionIfNeeded();
-    }
+    await requestPermissionIfNeeded();
     const devices = await navigator.mediaDevices.enumerateDevices();
     cameras.value = devices
       .filter((device) => device.kind === "videoinput")
@@ -65,13 +57,7 @@ async function refreshCameras() {
         label: device.label || `Camera ${index + 1}`,
       }));
 
-    console.log(
-      "[webcam] enumerated",
-      cameras.value.map((c) => c.deviceId),
-    );
-
     if (!props.cameraId && cameras.value.length > 0) {
-      console.log("[webcam] auto-selecting", cameras.value[0].deviceId);
       emit("update:cameraId", cameras.value[0].deviceId);
     }
   } catch (err) {
@@ -88,10 +74,10 @@ function wait(ms) {
 // The very first capture pipeline built right after app launch can silently
 // negotiate to a stalled state (no error, no frames) on some camera/driver
 // combos; a stream restart reliably clears it, so detect the stall instead
-// of leaving the preview blank until the user reselects the camera by hand.
-// Polling decoded frame dimensions is used instead of the "loadeddata" event
-// since that event doesn't fire reliably for live MediaStream video in every
-// WebKit build.
+// of leaving the preview blank forever with no feedback. Polling decoded
+// frame dimensions is used instead of the "loadeddata" event since that
+// event doesn't fire reliably for live MediaStream video in every WebKit
+// build.
 function waitForFirstFrame(videoElement, timeoutMs) {
   if (videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
     return Promise.resolve(true);
@@ -144,8 +130,6 @@ async function startPreview(deviceId) {
   for (let attempt = 1; attempt <= MAX_PREVIEW_ATTEMPTS; attempt++) {
     if (requestId !== latestRequestId) return;
 
-    console.log(`[webcam] attempt ${attempt} opening`, deviceId);
-
     try {
       error.value = "";
       stopStream();
@@ -174,30 +158,13 @@ async function startPreview(deviceId) {
         return;
       }
 
-      console.log(
-        "[webcam] getUserMedia resolved",
-        next.getVideoTracks().map((track) => track.getSettings()),
-      );
-
       stream.value = next;
-
-      console.log("[webcam] videoEl.value truthy?", !!videoEl.value);
 
       if (videoEl.value) {
         videoEl.value.srcObject = next;
-        console.log("[webcam] srcObject assigned, calling play()");
         await videoEl.value.play();
-        console.log("[webcam] play() resolved, readyState", videoEl.value.readyState);
 
-        const gotFrame = await waitForFirstFrame(videoEl.value, 1500);
-        console.log(
-          "[webcam] waitForFirstFrame",
-          gotFrame,
-          videoEl.value.videoWidth,
-          videoEl.value.videoHeight,
-        );
-
-        if (!gotFrame) {
+        if (!(await waitForFirstFrame(videoEl.value, 1500))) {
           lastError = new Error("Camera opened but never produced a frame");
           continue;
         }
@@ -205,7 +172,6 @@ async function startPreview(deviceId) {
 
       return;
     } catch (err) {
-      console.error("[webcam] attempt failed", err?.name, err?.message);
       lastError = err;
       if (!RETRYABLE_ERROR_NAMES.has(err?.name)) {
         break;
@@ -249,15 +215,19 @@ async function goFullscreen() {
 watch(
   () => props.cameraId,
   (deviceId) => {
-    console.log("[webcam] watcher firing for", deviceId);
     startPreview(deviceId);
   },
 );
 
 onMounted(async () => {
+  try {
+    isLinux.value = (await getPlatform()) === "linux";
+  } catch {
+    isLinux.value = false;
+  }
+
   await refreshCameras();
   if (props.cameraId) {
-    console.log("[webcam] onMounted follow-up calling startPreview for", props.cameraId);
     await startPreview(props.cameraId);
   }
 });
@@ -272,13 +242,7 @@ onBeforeUnmount(() => {
     <header class="panel-header">
       <h2>Video Source</h2>
       <div class="controls">
-        <select
-          :value="cameraId"
-          @change="
-            console.log('[webcam] select change event fired, value =', $event.target.value);
-            emit('update:cameraId', $event.target.value);
-          "
-        >
+        <select :value="cameraId" @change="emit('update:cameraId', $event.target.value)">
           <option value="">Select a camera…</option>
           <option v-for="camera in cameras" :key="camera.deviceId" :value="camera.deviceId">
             {{ camera.label }}
@@ -289,6 +253,11 @@ onBeforeUnmount(() => {
         <button type="button" @click="goFullscreen">Fullscreen</button>
       </div>
     </header>
+
+    <p v-if="isLinux" class="linux-note">
+      On Linux, OBS Virtual Camera preview doesn't work due to a WebKitGTK bug (filed upstream).
+      Physical cameras work normally.
+    </p>
 
     <div class="preview-wrapper">
       <video ref="videoEl" muted playsinline autoplay class="preview cover" />
@@ -321,6 +290,15 @@ onBeforeUnmount(() => {
   margin: 0;
   font-size: 14px;
   font-weight: 700;
+}
+
+.linux-note {
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #a8761c;
+  background: rgba(168, 118, 28, 0.12);
+  border-bottom: 1px solid var(--panel-border);
 }
 
 .controls {

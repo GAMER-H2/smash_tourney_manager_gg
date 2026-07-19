@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, reactive, ref } from "vue";
-import { characterIconSrc } from "../lib/characters";
+import { characterIconLabel, characterIconSrc } from "../lib/characters";
 
 const props = defineProps({
   modelValue: {
@@ -158,7 +158,7 @@ onBeforeUnmount(() => {
           :alt="modelValue"
           @error="onIconError(modelValue)"
         />
-        <span v-else class="icon-fallback small">{{ modelValue.charAt(0) }}</span>
+        <span v-else class="icon-fallback small">{{ characterIconLabel(modelValue) }}</span>
       </span>
       <span class="trigger-label">{{ modelValue || label }}</span>
     </button>
@@ -201,7 +201,7 @@ onBeforeUnmount(() => {
                   loading="lazy"
                   @error="onIconError(entry.name)"
                 />
-                <span v-else class="icon-fallback">{{ entry.name.charAt(0) }}</span>
+                <span v-else class="icon-fallback">{{ characterIconLabel(entry.name) }}</span>
               </span>
               <span class="cell-name">{{ entry.name }}</span>
             </button>

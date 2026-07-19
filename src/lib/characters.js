@@ -90,12 +90,29 @@ const CHARACTER_ICON_FILES = {
   Sora: "trail",
 };
 
+export const RANDOM_CHARACTER = "Random";
+
 export function characterIconSrc(name) {
   const file = CHARACTER_ICON_FILES[name];
   return file ? `/character-icons/${file}.png` : null;
 }
 
+// The bare icon filename (no extension/path), used to tell the Tauri backend
+// which bundled PNG to stage next to program_state.json for the stream
+// overlay - distinct from characterIconSrc(), which is a dev-server URL only
+// this app's own webview can resolve.
+export function characterIconFile(name) {
+  return CHARACTER_ICON_FILES[name] || null;
+}
+
+// Random has no artwork - it's always shown as a plain "?" rather than
+// falling back to its first letter like an unrecognized character would.
+export function characterIconLabel(name) {
+  return name === RANDOM_CHARACTER ? "?" : name.charAt(0);
+}
+
 export const SMASH_ULTIMATE_CHARACTERS = [
+  "Random",
   "Mario",
   "Donkey Kong",
   "Link",

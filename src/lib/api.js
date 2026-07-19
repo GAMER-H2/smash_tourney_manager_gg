@@ -19,3 +19,7 @@ export async function reportSetResult(request) {
 export async function writeStreamOverlay(request) {
   return invoke("write_stream_overlay", { request });
 }
+
+export async function getPlatform() {
+  return invoke("get_platform");
+}

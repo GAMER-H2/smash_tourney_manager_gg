@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from "vue";
 import CharacterPicker from "./CharacterPicker.vue";
+import { canReportGame } from "../lib/set-utils";
 
 const props = defineProps({
   title: {
@@ -23,6 +24,10 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  allowSwap: {
+    type: Boolean,
+    default: false,
+  },
   submitting: {
     type: Boolean,
     default: false,
@@ -39,6 +44,7 @@ const emit = defineEmits([
   "set-player-name",
   "set-game-character",
   "toggle-game-winner",
+  "swap-players",
   "apply-overlay",
   "submit",
 ]);
@@ -64,6 +70,10 @@ const p2Wins = computed(() => {
 const gameIndices = computed(() =>
   Array.from({ length: gameCount.value }, (_, index) => index),
 );
+
+function reportLocked(index) {
+  return !props.setData?.games[index]?.winner && !canReportGame(props.setData, index);
+}
 </script>
 
 <template>
@@ -91,6 +101,15 @@ const gameIndices = computed(() =>
           <option :value="3">Best of 3</option>
           <option :value="5">Best of 5</option>
         </select>
+        <button
+          v-if="allowSwap"
+          type="button"
+          class="swap-btn"
+          title="Swap players"
+          @click="emit('swap-players')"
+        >
+          ⇄ Swap Players
+        </button>
       </div>
 
       <div class="player-grid">
@@ -114,12 +133,13 @@ const gameIndices = computed(() =>
       </div>
 
       <div class="games-list">
-        <div v-for="index in gameIndices" :key="index" class="game-row">
+        <div v-for="index in gameIndices" :key="index" class="game-row" :class="{ locked: reportLocked(index) }">
           <div class="game-controls">
             <button
               type="button"
               class="win-btn"
               :class="{ active: setData.games[index]?.winner === 1 }"
+              :disabled="reportLocked(index)"
               @click="emit('toggle-game-winner', { index, winner: 1 })"
             >
               W
@@ -129,6 +149,7 @@ const gameIndices = computed(() =>
               type="button"
               class="win-btn"
               :class="{ active: setData.games[index]?.winner === 2 }"
+              :disabled="reportLocked(index)"
               @click="emit('toggle-game-winner', { index, winner: 2 })"
             >
               W
@@ -214,6 +235,11 @@ const gameIndices = computed(() =>
   gap: 8px;
 }
 
+.swap-btn {
+  margin-left: auto;
+  font-size: 12px;
+}
+
 .player-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -255,6 +281,10 @@ const gameIndices = computed(() =>
 .game-row:last-child {
   padding-bottom: 0;
   border-bottom: none;
+}
+
+.game-row.locked {
+  opacity: 0.5;
 }
 
 .game-controls {
