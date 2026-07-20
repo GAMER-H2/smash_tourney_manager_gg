@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { buildBracketLayout, buildRoundRobinGrid } from "../lib/bracket-utils";
+import { characterIconLabel, characterIconSrc } from "../lib/characters";
 
 const props = defineProps({
   tournamentData: {
@@ -33,6 +34,17 @@ const poolGrid = computed(() => buildRoundRobinGrid(activeBucket.value?.sets ?? 
 
 function isWinnerSlot(set, slot) {
   return Boolean(set.winnerId && slot?.entrantId && slot.entrantId === set.winnerId);
+}
+
+// Character picks only mean anything once games have actually been played,
+// so only show an icon for a reported (completed) set. Characters with no
+// artwork (Random, or anything we don't recognize) still get a fallback
+// badge rather than silently showing nothing.
+function slotCharacter(set, playerNum) {
+  if (set.state !== 3 || !set.winnerId) return null;
+  const name = playerNum === 1 ? set.player1Character : set.player2Character;
+  if (!name) return null;
+  return { name, src: characterIconSrc(name), label: characterIconLabel(name) };
 }
 
 // --- Connector line drawing ---
@@ -179,7 +191,18 @@ watch(
                   :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
                   :ref="(el) => setSlotRef(set.id, 1, el)"
                 >
-                  <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  <span class="slot-main">
+                    <template v-if="slotCharacter(set, 1)">
+                      <img
+                        v-if="slotCharacter(set, 1).src"
+                        class="slot-char-icon"
+                        :src="slotCharacter(set, 1).src"
+                        :alt="slotCharacter(set, 1).name"
+                      />
+                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 1).label }}</span>
+                    </template>
+                    <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  </span>
                   <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
                 </div>
                 <div
@@ -187,7 +210,18 @@ watch(
                   :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
                   :ref="(el) => setSlotRef(set.id, 2, el)"
                 >
-                  <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  <span class="slot-main">
+                    <template v-if="slotCharacter(set, 2)">
+                      <img
+                        v-if="slotCharacter(set, 2).src"
+                        class="slot-char-icon"
+                        :src="slotCharacter(set, 2).src"
+                        :alt="slotCharacter(set, 2).name"
+                      />
+                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 2).label }}</span>
+                    </template>
+                    <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  </span>
                   <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
                 </div>
               </article>
@@ -211,7 +245,18 @@ watch(
                   :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
                   :ref="(el) => setSlotRef(set.id, 1, el)"
                 >
-                  <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  <span class="slot-main">
+                    <template v-if="slotCharacter(set, 1)">
+                      <img
+                        v-if="slotCharacter(set, 1).src"
+                        class="slot-char-icon"
+                        :src="slotCharacter(set, 1).src"
+                        :alt="slotCharacter(set, 1).name"
+                      />
+                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 1).label }}</span>
+                    </template>
+                    <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
+                  </span>
                   <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
                 </div>
                 <div
@@ -219,7 +264,18 @@ watch(
                   :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
                   :ref="(el) => setSlotRef(set.id, 2, el)"
                 >
-                  <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  <span class="slot-main">
+                    <template v-if="slotCharacter(set, 2)">
+                      <img
+                        v-if="slotCharacter(set, 2).src"
+                        class="slot-char-icon"
+                        :src="slotCharacter(set, 2).src"
+                        :alt="slotCharacter(set, 2).name"
+                      />
+                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 2).label }}</span>
+                    </template>
+                    <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
+                  </span>
                   <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
                 </div>
               </article>
@@ -538,6 +594,30 @@ watch(
 .slot-row.placeholder {
   opacity: 0.6;
   font-style: italic;
+}
+
+.slot-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.slot-char-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.slot-char-fallback {
+  display: grid;
+  place-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  background: #2366d1;
+  color: #fff;
 }
 
 .slot-name {

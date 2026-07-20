@@ -108,7 +108,10 @@ export function characterIconFile(name) {
 // Random has no artwork - it's always shown as a plain "?" rather than
 // falling back to its first letter like an unrecognized character would.
 export function characterIconLabel(name) {
-  return name === RANDOM_CHARACTER ? "?" : name.charAt(0);
+  // Names pulled from start.gg's own character list don't necessarily match
+  // our RANDOM_CHARACTER constant exactly (e.g. different casing/wording),
+  // so match loosely rather than requiring an exact "Random".
+  return /random/i.test(name) ? "?" : name.charAt(0);
 }
 
 export const SMASH_ULTIMATE_CHARACTERS = [
@@ -200,3 +203,28 @@ export const SMASH_ULTIMATE_CHARACTERS = [
   "Kazuya",
   "Sora",
 ];
+
+function normalizeCharacterKey(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+// start.gg sometimes spells split/hyphenated character names differently
+// from our own list (e.g. its "Pyra & Mythra" vs our "Pyra/Mythra", or its
+// "Banjo-Kazooie" vs our "Banjo & Kazooie"). Comparing with punctuation and
+// case stripped out matches these variants without hardcoding each pair -
+// both reduce to "pyramythra" / "banjokazooie" either way.
+const NORMALIZED_CHARACTER_LOOKUP = new Map(
+  SMASH_ULTIMATE_CHARACTERS.map((name) => [normalizeCharacterKey(name), name]),
+);
+
+// Resolves a name from anywhere (our own picker, or pulled in from start.gg)
+// to our canonical character name, so icon lookups, picker highlighting, and
+// matching start.gg's own characterId when submitting all agree on one
+// spelling. Falls back to the original name if nothing matches.
+export function canonicalCharacterName(name) {
+  if (!name) return name;
+  if (/random/i.test(name)) return RANDOM_CHARACTER;
+  return NORMALIZED_CHARACTER_LOOKUP.get(normalizeCharacterKey(name)) || name;
+}

@@ -4,13 +4,20 @@ import WebcamPanel from "./components/WebcamPanel.vue";
 import SetEditor from "./components/SetEditor.vue";
 import BracketBoard from "./components/BracketBoard.vue";
 import {
+  fetchEntrantAvatars,
+  fetchGameCharacters,
   fetchTournamentState,
   loadConfig,
   reportSetResult,
   saveConfig,
   writeStreamOverlay,
 } from "./lib/api";
-import { characterIconFile, SMASH_ULTIMATE_CHARACTERS } from "./lib/characters";
+import {
+  canonicalCharacterName,
+  characterIconFile,
+  RANDOM_CHARACTER,
+  SMASH_ULTIMATE_CHARACTERS,
+} from "./lib/characters";
 import {
   canReportGame,
   cloneEditorSet,
@@ -48,6 +55,17 @@ const savingConfig = ref(false);
 
 const statusMessage = ref("");
 const errorMessage = ref("");
+
+// Character name -> start.gg characterId for the tournament's videogame, so
+// game reports can include per-game character selections. Refetched only
+// when the loaded tournament's videogame changes.
+const characterIdByName = ref(new Map());
+let loadedVideogameId = null;
+
+// Profile picture URLs for whoever's currently loaded into the stream set
+// editor - only ever needed for the overlay output, not shown in this app's
+// own UI, so this is deliberately not part of the editor set model itself.
+const streamAvatars = ref({ player1Avatar: null, player2Avatar: null });
 
 let overlayTimer = null;
 
@@ -142,8 +160,28 @@ function swapPlayers(targetRef) {
   });
 }
 
+async function refreshStreamAvatars(editorSet) {
+  streamAvatars.value = { player1Avatar: null, player2Avatar: null };
+
+  const player1EntrantId = editorSet?.player1?.entrantId ?? null;
+  const player2EntrantId = editorSet?.player2?.entrantId ?? null;
+  if (!config.apiToken.trim() || (!player1EntrantId && !player2EntrantId)) return;
+
+  try {
+    streamAvatars.value = await fetchEntrantAvatars({
+      apiToken: config.apiToken,
+      player1EntrantId,
+      player2EntrantId,
+    });
+  } catch (err) {
+    // Non-fatal: the overlay just goes out without a profile picture.
+    console.error("Failed to load player avatars", err);
+  }
+}
+
 function loadStreamSetFromTournamentSet(set) {
   streamSet.value = createEditorSetFromTournamentSet(set);
+  refreshStreamAvatars(streamSet.value);
   setSuccess(`Set ${set.id} moved to stream editor.`);
 }
 
@@ -170,6 +208,10 @@ function onStreamToggleWinner(payload) {
 
 function onStreamSwapPlayers() {
   swapPlayers(streamSet);
+  streamAvatars.value = {
+    player1Avatar: streamAvatars.value.player2Avatar,
+    player2Avatar: streamAvatars.value.player1Avatar,
+  };
 }
 
 function onQuickBestOf(value) {
@@ -223,12 +265,14 @@ function overlayRequestFromEditorSet(editorSet) {
       character: currentGameCharacter(editorSet, 1) || null,
       characterIcon: characterIconFile(currentGameCharacter(editorSet, 1)),
       score: winsFor(editorSet, 1),
+      avatarUrl: streamAvatars.value.player1Avatar || null,
     },
     player2: {
       name: editorSet.player2.name || "Player 2",
       character: currentGameCharacter(editorSet, 2) || null,
       characterIcon: characterIconFile(currentGameCharacter(editorSet, 2)),
       score: winsFor(editorSet, 2),
+      avatarUrl: streamAvatars.value.player2Avatar || null,
     },
   };
 }
@@ -283,6 +327,45 @@ function requireStartggConfig() {
   return true;
 }
 
+async function ensureCharacterIdMap(videogameId) {
+  if (!videogameId || videogameId === loadedVideogameId) return;
+
+  try {
+    const characters = await fetchGameCharacters({
+      apiToken: config.apiToken,
+      videogameId,
+    });
+    // Keyed by OUR canonical name (not start.gg's raw name, e.g. "Pyra &
+    // Mythra") so a pick made via our own CharacterPicker - which only ever
+    // offers our canonical spelling - resolves to the right characterId.
+    characterIdByName.value = new Map(
+      characters.map((c) => [canonicalCharacterName(c.name), c.id]),
+    );
+    loadedVideogameId = videogameId;
+  } catch (err) {
+    // Non-fatal: game reports just go out without character selections.
+    console.error("Failed to load character list for videogame", videogameId, err);
+  }
+}
+
+// start.gg doesn't always spell split character names the same way our own
+// picker does (e.g. "Pyra & Mythra" vs our "Pyra/Mythra") - canonicalize
+// every character name pulled in from a tournament fetch so icon lookups,
+// picker highlighting, and character-id resolution on submit all agree.
+function canonicalizeFetchedCharacters(data) {
+  for (const bucket of data?.buckets ?? []) {
+    for (const set of bucket.sets ?? []) {
+      if (set.player1Character) set.player1Character = canonicalCharacterName(set.player1Character);
+      if (set.player2Character) set.player2Character = canonicalCharacterName(set.player2Character);
+      for (const game of set.games ?? []) {
+        if (game.player1Character) game.player1Character = canonicalCharacterName(game.player1Character);
+        if (game.player2Character) game.player2Character = canonicalCharacterName(game.player2Character);
+      }
+    }
+  }
+  return data;
+}
+
 async function refreshTournament() {
   if (!requireStartggConfig()) return;
 
@@ -294,7 +377,9 @@ async function refreshTournament() {
       perPage: Number(config.perPage) || 128,
     });
 
+    canonicalizeFetchedCharacters(data);
     tournamentData.value = data;
+    await ensureCharacterIdMap(data.videogameId);
 
     if (!data.buckets?.find((bucket) => bucket.id === activeBucketId.value)) {
       activeBucketId.value = data.buckets?.[0]?.id || "";
@@ -342,6 +427,36 @@ async function persistConfig() {
   }
 }
 
+// Per-game winner + character selections for the games that have actually
+// been played, in the shape start.gg's reportBracketSet gameData expects.
+// Random or unrecognized character picks are just left out of selections -
+// there's no start.gg characterId for those.
+function buildGameData(editorSet) {
+  const games = editorSet?.games ?? [];
+
+  return games
+    .map((game, index) => {
+      if (!game?.winner) return null;
+
+      const winner =
+        game.winner === 1 ? editorSet.player1.entrantId : editorSet.player2.entrantId;
+
+      const selections = [];
+      const addSelection = (entrantId, characterName) => {
+        if (!entrantId || !characterName || characterName === RANDOM_CHARACTER) return;
+        const characterId = characterIdByName.value.get(characterName);
+        if (!characterId) return;
+        selections.push({ entrantId, characterId });
+      };
+
+      addSelection(editorSet.player1.entrantId, game.player1Character);
+      addSelection(editorSet.player2.entrantId, game.player2Character);
+
+      return { gameNum: index + 1, winnerId: winner || null, selections };
+    })
+    .filter(Boolean);
+}
+
 async function submitSet(editorSet, mode) {
   const winnerId = winnerEntrantId(editorSet);
 
@@ -367,10 +482,13 @@ async function submitSet(editorSet, mode) {
   }
 
   try {
+    const gameData = buildGameData(editorSet);
+
     await reportSetResult({
       apiToken: config.apiToken,
       setId: editorSet.setId,
       winnerId,
+      gameData: gameData.length ? gameData : null,
     });
 
     setSuccess(`Reported set ${editorSet.setId} to start.gg.`);
@@ -445,7 +563,7 @@ const showError = computed(() => Boolean(errorMessage.value));
   <main class="app">
     <section class="config-panel">
       <header class="config-panel-header">
-        <h1>Tournament Stream Manager (start.gg + Tauri)</h1>
+        <h1>Tournament Stream Manager</h1>
         <button type="button" class="collapse-toggle" @click="toggleConfigPanel">
           {{ configPanelOpen ? "Hide settings ▲" : "Show settings ▼" }}
         </button>

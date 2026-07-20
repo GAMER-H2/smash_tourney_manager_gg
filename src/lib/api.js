@@ -16,6 +16,14 @@ export async function reportSetResult(request) {
   return invoke("report_set_result", { request });
 }
 
+export async function fetchGameCharacters(request) {
+  return invoke("fetch_game_characters", { request });
+}
+
+export async function fetchEntrantAvatars(request) {
+  return invoke("fetch_entrant_avatars", { request });
+}
+
 export async function writeStreamOverlay(request) {
   return invoke("write_stream_overlay", { request });
 }

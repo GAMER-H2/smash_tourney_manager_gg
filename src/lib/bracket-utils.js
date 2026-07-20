@@ -60,7 +60,11 @@ function buildEdges(sets) {
 
   for (const set of sets) {
     [set.player1, set.player2].forEach((slot, index) => {
-      if (slot?.sourceType === "set" && slot?.sourceSetId) {
+      // Only draw "winner advances" connectors. Drop lines showing where a
+      // set's loser falls to (sourcePlacement === 2) - with winners and
+      // losers rounds stacked in separate rows, those lines mostly just
+      // crisscross the whole board without adding much clarity.
+      if (slot?.sourceType === "set" && slot?.sourceSetId && slot.sourcePlacement !== 2) {
         edges.push({
           fromSetId: slot.sourceSetId,
           toSetId: set.id,
@@ -140,21 +144,43 @@ export function buildBracketLayout(rawSets) {
     });
   }
 
-  const sortedGrandFinal = [...grandFinalSets].sort((a, b) => {
-    const resetDiff = Number(isReset(a)) - Number(isReset(b));
-    if (resetDiff !== 0) return resetDiff;
-    if (a.round !== b.round) return a.round - b.round;
-    return a.id - b.id;
-  });
+  const byId = new Map(enrichedSets.map((set) => [set.id, set]));
+  const gf1 = grandFinalSets.find((set) => !isReset(set));
+  const gfReset = grandFinalSets.find((set) => isReset(set));
 
-  const grandFinal = sortedGrandFinal.map((set, index) => ({
+  // start.gg always allocates a slot for the bracket reset, whether or not
+  // it ends up needed - only show it once the entrant who came from losers
+  // has actually won the first grand final (or the reset was already played,
+  // e.g. after a DQ where the heuristic below might not hold).
+  const resetIsNeeded =
+    Boolean(gfReset) &&
+    (Boolean(gfReset.winnerId) ||
+      (Boolean(gf1?.winnerId) &&
+        [gf1.player1, gf1.player2].some((slot) => {
+          if (slot?.sourceType !== "set" || !slot?.sourceSetId) return false;
+          const source = byId.get(slot.sourceSetId);
+          return Number(source?.round) < 0 && slot.entrantId === gf1.winnerId;
+        })));
+
+  const visibleGrandFinalSets = [gf1, resetIsNeeded ? gfReset : null].filter(Boolean);
+
+  const grandFinal = visibleGrandFinalSets.map((set, index) => ({
     key: `gf-${index}`,
     round: set.round,
     label: set.roundText || (index === 0 ? "Grand Final" : "Grand Final Reset"),
     sets: [set],
   }));
 
-  const edges = buildEdges(enrichedSets);
+  // Losers Finals feeds into Grand Final, but the two live in different rows
+  // (losers bracket renders in its own row below winners+GF), so that
+  // connector is a long line crossing the whole board for something already
+  // obvious once GF's card shows the entrant's name - drop it. Winners
+  // Finals -> Grand Final stays: it's a short connector within the same row
+  // and is still useful there.
+  const lastLosersColumn = losers[losers.length - 1];
+  const terminalSetIds = new Set(lastLosersColumn?.sets.map((set) => set.id) ?? []);
+
+  const edges = buildEdges(enrichedSets).filter((edge) => !terminalSetIds.has(edge.fromSetId));
 
   return { isBracket: true, winners, losers, grandFinal, edges };
 }
