@@ -12,6 +12,13 @@ const props = defineProps({
     type: String,
     default: "",
   },
+  // Map<bucketId, { locked, attempts }> - buckets currently waiting on
+  // start.gg to catch up after a report started them, per App.vue's
+  // bucket-sync queue. Absent/no entry means "synced normally".
+  bucketSyncState: {
+    type: Object,
+    default: () => new Map(),
+  },
 });
 
 const emit = defineEmits(["update:activeBucketId", "set-on-stream", "quick-report"]);
@@ -31,6 +38,30 @@ const layout = computed(() => buildBracketLayout(activeBucket.value?.sets ?? [])
 const winnersColumns = computed(() => [...layout.value.winners, ...layout.value.grandFinal]);
 
 const poolGrid = computed(() => buildRoundRobinGrid(activeBucket.value?.sets ?? []));
+
+const activeBucketSync = computed(() =>
+  activeBucket.value ? props.bucketSyncState.get(activeBucket.value.id) : null,
+);
+
+const activeBucketLocked = computed(() => Boolean(activeBucketSync.value?.locked));
+
+// Pools (round-robin, not the elimination bracket) don't need a "finalize
+// placements" reminder until every set in them has actually been reported.
+// Checked against poolGrid's own cells - the exact same data the grid
+// renders its won/lost coloring from - rather than the raw bucket.sets
+// list, so this always agrees with what's actually showing on screen.
+const activeBucketPoolComplete = computed(() => {
+  if (!activeBucket.value || layout.value.isBracket) return false;
+  const cells = poolGrid.value.rows
+    .flatMap((row) => row.cells)
+    .filter((cell) => cell.kind === "set");
+  return cells.length > 0 && cells.every((cell) => cell.isComplete);
+});
+
+function onSetClick(set, event) {
+  if (activeBucketLocked.value) return;
+  emit(event, set);
+}
 
 function isWinnerSlot(set, slot) {
   return Boolean(set.winnerId && slot?.entrantId && slot.entrantId === set.winnerId);
@@ -154,6 +185,18 @@ watch(
       </p>
     </header>
 
+    <p v-if="activeBucketLocked" class="notice notice-locked">
+      "{{ activeBucket.name }}" hasn't synced with start.gg yet after several attempts - refresh
+      the tournament manually to continue reporting sets here.
+    </p>
+    <p v-else-if="activeBucketSync" class="notice notice-syncing">
+      Waiting for start.gg to catch up on "{{ activeBucket.name }}" - reports made here are being
+      saved locally and will sync automatically once it reloads.
+    </p>
+    <p v-else-if="activeBucketPoolComplete" class="notice notice-info">
+      This pool is complete - remember to finalize placements on start.gg when convenient.
+    </p>
+
     <div class="tabs" v-if="buckets.length">
       <button
         v-for="bucket in buckets"
@@ -182,9 +225,10 @@ watch(
               <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
               <article
                 class="match-card"
+                :class="{ locked: activeBucketLocked }"
                 :ref="(el) => setCardRef(set.id, el)"
-                @click="emit('quick-report', set)"
-                @contextmenu.prevent="emit('set-on-stream', set)"
+                @click="onSetClick(set, 'quick-report')"
+                @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
               >
                 <div
                   class="slot-row"
@@ -236,9 +280,10 @@ watch(
               <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
               <article
                 class="match-card"
+                :class="{ locked: activeBucketLocked }"
                 :ref="(el) => setCardRef(set.id, el)"
-                @click="emit('quick-report', set)"
-                @contextmenu.prevent="emit('set-on-stream', set)"
+                @click="onSetClick(set, 'quick-report')"
+                @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
               >
                 <div
                   class="slot-row"
@@ -321,9 +366,10 @@ watch(
                 empty: cell.kind === 'empty',
                 won: cell.kind === 'set' && cell.rowWon,
                 lost: cell.kind === 'set' && cell.rowLost,
+                locked: cell.kind === 'set' && activeBucketLocked,
               }"
-              @click="cell.kind === 'set' && emit('quick-report', cell.set)"
-              @contextmenu.prevent="cell.kind === 'set' && emit('set-on-stream', cell.set)"
+              @click="cell.kind === 'set' && onSetClick(cell.set, 'quick-report')"
+              @contextmenu.prevent="cell.kind === 'set' && onSetClick(cell.set, 'set-on-stream')"
             >
               <span v-if="cell.kind === 'set'" class="pool-score">
                 {{ cell.rowScore }} - {{ cell.colScore }}
@@ -374,6 +420,41 @@ watch(
   font-size: 12px;
   opacity: 0.85;
 }
+
+.notice {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.notice-info {
+  color: #1a6b3c;
+  background: rgba(35, 143, 79, 0.12);
+}
+
+.notice-syncing {
+  color: #8a5a00;
+  background: rgba(255, 179, 0, 0.15);
+}
+
+.notice-locked {
+  color: #a11e1e;
+  background: rgba(161, 30, 30, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  .notice-info {
+    color: #6fd99a;
+  }
+  .notice-syncing {
+    color: #ffcc66;
+  }
+  .notice-locked {
+    color: #ff8a8a;
+  }
+}
+
 
 .tabs {
   display: flex;
@@ -556,6 +637,12 @@ watch(
   position: relative;
   z-index: 1;
   overflow: hidden;
+}
+
+.match-card.locked,
+.pool-cell.locked {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .match-card:hover {

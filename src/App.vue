@@ -67,7 +67,26 @@ let loadedVideogameId = null;
 // own UI, so this is deliberately not part of the editor set model itself.
 const streamAvatars = ref({ player1Avatar: null, player2Avatar: null });
 
+// start.gg's API caches event/set data server-side for up to ~60s (visible
+// as `cacheControl.maxAge: 60` in its own responses). Reporting the first
+// set in a pool/bracket starts it on start.gg's side instantly, but that
+// cache can make our very next fetch come back as if the pool/bracket
+// doesn't exist at all for a while after. bucketSync tracks any bucket
+// caught in that gap: bucketId -> { snapshot, queue, attempts, locked }.
+//   snapshot: last-known bucket (plus any optimistic local reports), kept
+//             displayed in place of the "missing" bucket so nothing
+//             disappears out from under the user.
+//   queue:    further reports made against this bucket while it's still
+//             missing - held back rather than sent immediately, since we
+//             don't yet know the real (post-restart) set ids to send them
+//             against, and replayed once the bucket reappears.
+//   attempts: retries so far (one every 10s, giving up at 90s).
+//   locked:   true once retries are exhausted - reporting into this bucket
+//             is blocked until a manual refresh brings it back.
+const bucketSync = reactive(new Map());
+
 let overlayTimer = null;
+let bucketSyncRetryTimer = null;
 
 function setSuccess(message) {
   errorMessage.value = "";
@@ -77,6 +96,159 @@ function setSuccess(message) {
 function setError(message) {
   statusMessage.value = "";
   errorMessage.value = message;
+}
+
+function findBucketIdForSetId(buckets, setId) {
+  return buckets?.find((bucket) => bucket.sets.some((set) => set.id === setId))?.id ?? null;
+}
+
+function cloneBucket(bucket) {
+  return JSON.parse(JSON.stringify(bucket));
+}
+
+function matchesEntrantPair(set, entrantIdA, entrantIdB) {
+  const a = set.player1?.entrantId;
+  const b = set.player2?.entrantId;
+  return (a === entrantIdA && b === entrantIdB) || (a === entrantIdB && b === entrantIdA);
+}
+
+// Marks a set within a (possibly stale, locally-held) bucket snapshot as
+// reported, so the bracket view reflects it immediately rather than
+// waiting on start.gg to confirm it - including advancing the winner (and
+// loser, for a drop to losers bracket) into whatever slot sources from this
+// set, so the bracket shows progression instead of "TBD" while we wait.
+// Safe to guess at: if start.gg's real data disagrees once it comes back,
+// that overwrites this regardless.
+function applyOptimisticResult(bucket, setId, editorSet, winnerEntrantId) {
+  const target = bucket?.sets.find((set) => set.id === setId);
+  if (!target) return;
+
+  const winnerSlot = target.player1?.entrantId === winnerEntrantId ? target.player1 : target.player2;
+  const loserSlot = target.player1?.entrantId === winnerEntrantId ? target.player2 : target.player1;
+
+  target.state = 3;
+  target.winnerId = winnerEntrantId;
+  if (target.player1) target.player1.score = winsFor(editorSet, 1);
+  if (target.player2) target.player2.score = winsFor(editorSet, 2);
+
+  for (const nextSet of bucket.sets) {
+    for (const slot of [nextSet.player1, nextSet.player2]) {
+      if (slot?.sourceType !== "set" || slot?.sourceSetId !== setId) continue;
+      const advancing = slot.sourcePlacement === 2 ? loserSlot : winnerSlot;
+      if (!advancing?.entrantId) continue;
+      slot.entrantId = advancing.entrantId;
+      slot.name = advancing.name;
+    }
+  }
+}
+
+// Sends every queued report for a bucket that's just reappeared, matching
+// each one to its real set by entrant pair (set ids change once a
+// preview-format pool/bracket actually starts, but who's playing whom
+// doesn't). Anything start.gg already has a result for wins over our queued
+// guess, and anything we can't match is just dropped rather than guessed at.
+async function drainBucketSyncQueue(state, freshBucket) {
+  for (const item of state.queue) {
+    const target = freshBucket.sets.find((set) =>
+      matchesEntrantPair(set, item.player1EntrantId, item.player2EntrantId),
+    );
+    if (!target || target.winnerId) continue;
+
+    try {
+      await reportSetResult({
+        apiToken: config.apiToken,
+        setId: target.id,
+        winnerId: item.winnerEntrantId,
+        gameData: item.gameData,
+      });
+    } catch (err) {
+      console.error("Failed to replay a queued report", err);
+    }
+  }
+}
+
+// Registers a just-vanished bucket as pending and reinjects its snapshot
+// immediately - callers must do this *before* resolving the active tab
+// (see finishTournamentRefresh), or the tab fallback runs against a bucket
+// list that still looks like it's missing and jumps away right as this
+// reinjects it.
+function registerPendingBucket(bucketId, snapshot) {
+  bucketSync.set(bucketId, { snapshot, queue: [], attempts: 0, locked: false });
+  reinjectPendingSnapshots();
+  scheduleBucketSyncRetry();
+}
+
+function reinjectPendingSnapshots() {
+  for (const state of bucketSync.values()) {
+    const stillMissing = !tournamentData.value?.buckets?.some((bucket) => bucket.id === state.snapshot.id);
+    if (stillMissing) {
+      tournamentData.value.buckets.push(state.snapshot);
+    }
+  }
+}
+
+function scheduleBucketSyncRetry() {
+  const hasUnlockedPending = [...bucketSync.values()].some((state) => !state.locked);
+  if (!hasUnlockedPending || bucketSyncRetryTimer) return;
+
+  bucketSyncRetryTimer = setTimeout(async () => {
+    bucketSyncRetryTimer = null;
+    await refreshTournament({ silent: true });
+  }, 10_000);
+}
+
+// Runs on every tournament fetch (manual, submit-triggered, or one of this
+// mechanism's own retries) - checks whether any bucket we're waiting on has
+// reappeared yet, drains its queue if so, and otherwise counts the attempt
+// (locking it after ~90s) and keeps its last-known snapshot visible.
+// Returns true if a bucket just got locked (in which case the caller
+// shouldn't immediately overwrite that error with a generic success
+// message).
+async function reconcileBucketSync() {
+  if (bucketSync.size === 0) return false;
+
+  let newlyLocked = false;
+  let anyDrained = false;
+
+  for (const [bucketId, state] of [...bucketSync.entries()]) {
+    if (state.locked) continue;
+
+    // Excludes our own reinjected snapshot - it has the same id but isn't
+    // real data, so it would otherwise always look "found" the moment we
+    // inject it, short-circuiting the wait before it's even started.
+    const freshBucket = tournamentData.value?.buckets?.find(
+      (bucket) => bucket.id === bucketId && bucket !== state.snapshot,
+    );
+    if (freshBucket) {
+      if (state.queue.length) {
+        await drainBucketSyncQueue(state, freshBucket);
+        anyDrained = true;
+      }
+      bucketSync.delete(bucketId);
+      continue;
+    }
+
+    state.attempts += 1;
+    if (state.attempts * 10 >= 90) {
+      state.locked = true;
+      newlyLocked = true;
+      setError(
+        `"${state.snapshot.name}" hasn't synced with start.gg yet - refresh the tournament manually to continue reporting there.`,
+      );
+    }
+  }
+
+  if (anyDrained) {
+    // Replaying the queue just changed start.gg's data out from under the
+    // fetch we're reconciling against - re-fetch once more so what we just
+    // sent actually shows up, instead of leaving the pre-drain ("still
+    // unreported") view on screen and risking someone re-reporting it.
+    await fetchAndApplyTournamentData();
+  }
+
+  reinjectPendingSnapshots();
+  scheduleBucketSyncRetry();
+  return newlyLocked;
 }
 
 function updateEditorSet(targetRef, updater) {
@@ -179,13 +351,34 @@ async function refreshStreamAvatars(editorSet) {
   }
 }
 
-function loadStreamSetFromTournamentSet(set) {
+async function loadStreamSetFromTournamentSet(set) {
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, set.id);
+  if (bucketSync.get(bucketId)?.locked) {
+    setError("This pool/bracket hasn't synced with start.gg yet - refresh manually before continuing.");
+    return;
+  }
+
   streamSet.value = createEditorSetFromTournamentSet(set);
-  refreshStreamAvatars(streamSet.value);
   setSuccess(`Set ${set.id} moved to stream editor.`);
+
+  // Setting streamSet above already schedules a debounced overlay write,
+  // but that's a fixed 350ms timer racing an actual network fetch here - the
+  // avatar frequently wasn't back yet when it fired, writing the overlay
+  // without one (only fixed by re-selecting the set, which just re-rolled
+  // the same race). Write again, explicitly, once the avatar fetch settles.
+  await refreshStreamAvatars(streamSet.value);
+  if (config.autoWriteOverlay) {
+    await writeOverlayFromStreamSet(true);
+  }
 }
 
 function openQuickReport(set) {
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, set.id);
+  if (bucketSync.get(bucketId)?.locked) {
+    setError("This pool/bracket hasn't synced with start.gg yet - refresh manually before continuing.");
+    return;
+  }
+
   quickReportSet.value = createEditorSetFromTournamentSet(set);
   quickReportOpen.value = true;
 }
@@ -366,41 +559,62 @@ function canonicalizeFetchedCharacters(data) {
   return data;
 }
 
-async function refreshTournament() {
+async function fetchAndApplyTournamentData() {
+  const data = await fetchTournamentState({
+    apiToken: config.apiToken,
+    tournamentSlug: config.tournamentSlug,
+    perPage: Number(config.perPage) || 128,
+  });
+
+  canonicalizeFetchedCharacters(data);
+  tournamentData.value = data;
+  return data;
+}
+
+// The rest of a refresh, once tournamentData holds a fetch's raw result:
+// reconciling bucket sync, resolving the active tab, the character-id map,
+// and the stream editor's character carry-over. Split out from the fetch
+// so submitSet can reinject a just-vanished bucket in between fetching and
+// this running - otherwise the active-tab fallback below runs first and
+// jumps away before there's anything to find it again.
+async function finishTournamentRefresh({ silent = false } = {}) {
+  const bucketJustLocked = await reconcileBucketSync();
+  const data = tournamentData.value;
+
+  if (!data?.buckets?.find((bucket) => bucket.id === activeBucketId.value)) {
+    activeBucketId.value = data?.buckets?.[0]?.id || "";
+  }
+
+  await ensureCharacterIdMap(data?.videogameId);
+
+  if (streamSet.value?.setId) {
+    const allSets = (data?.buckets || []).flatMap((bucket) => bucket.sets || []);
+    const matching = allSets.find((set) => set.id === streamSet.value.setId);
+    if (matching) {
+      const updated = createEditorSetFromTournamentSet(matching);
+      updated.games.forEach((game, index) => {
+        const previousGame = streamSet.value.games[index];
+        if (!previousGame) return;
+        game.player1Character = previousGame.player1Character;
+        game.player2Character = previousGame.player2Character;
+      });
+      streamSet.value = updated;
+    }
+  }
+
+  // Don't stomp the "hasn't synced" error reconcileBucketSync just set.
+  if (!silent && !bucketJustLocked) {
+    setSuccess(`Loaded ${data?.totalSets ?? 0} sets from ${data?.tournamentName ?? ""}.`);
+  }
+}
+
+async function refreshTournament({ silent = false } = {}) {
   if (!requireStartggConfig()) return;
 
   loadingTournament.value = true;
   try {
-    const data = await fetchTournamentState({
-      apiToken: config.apiToken,
-      tournamentSlug: config.tournamentSlug,
-      perPage: Number(config.perPage) || 128,
-    });
-
-    canonicalizeFetchedCharacters(data);
-    tournamentData.value = data;
-    await ensureCharacterIdMap(data.videogameId);
-
-    if (!data.buckets?.find((bucket) => bucket.id === activeBucketId.value)) {
-      activeBucketId.value = data.buckets?.[0]?.id || "";
-    }
-
-    if (streamSet.value?.setId) {
-      const allSets = (data.buckets || []).flatMap((bucket) => bucket.sets || []);
-      const matching = allSets.find((set) => set.id === streamSet.value.setId);
-      if (matching) {
-        const updated = createEditorSetFromTournamentSet(matching);
-        updated.games.forEach((game, index) => {
-          const previousGame = streamSet.value.games[index];
-          if (!previousGame) return;
-          game.player1Character = previousGame.player1Character;
-          game.player2Character = previousGame.player2Character;
-        });
-        streamSet.value = updated;
-      }
-    }
-
-    setSuccess(`Loaded ${data.totalSets} sets from ${data.tournamentName}.`);
+    await fetchAndApplyTournamentData();
+    await finishTournamentRefresh({ silent });
   } catch (err) {
     setError(`Failed to fetch tournament: ${String(err)}`);
   } finally {
@@ -475,6 +689,16 @@ async function submitSet(editorSet, mode) {
     return;
   }
 
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, editorSet.setId);
+  const pending = bucketId ? bucketSync.get(bucketId) : null;
+
+  if (pending?.locked) {
+    setError(
+      `"${pending.snapshot.name}" hasn't synced with start.gg yet - refresh the tournament manually before reporting more results there.`,
+    );
+    return;
+  }
+
   if (mode === "stream") {
     submittingStream.value = true;
   } else {
@@ -483,12 +707,38 @@ async function submitSet(editorSet, mode) {
 
   try {
     const gameData = buildGameData(editorSet);
+    const gameDataPayload = gameData.length ? gameData : null;
+
+    if (pending) {
+      // Still waiting on start.gg to reflect whatever started this
+      // pool/bracket - queue this one instead of sending it against a set
+      // id that's about to be replaced, and apply it locally so everything
+      // else (characters, the overlay, further edits) keeps working.
+      pending.queue.push({
+        player1EntrantId: editorSet.player1.entrantId,
+        player2EntrantId: editorSet.player2.entrantId,
+        winnerEntrantId: winnerId,
+        gameData: gameDataPayload,
+      });
+      applyOptimisticResult(pending.snapshot, editorSet.setId, editorSet, winnerId);
+
+      setSuccess(`Saved locally - will sync to start.gg once "${pending.snapshot.name}" reloads.`);
+
+      if (mode === "stream") {
+        await writeOverlayFromStreamSet(true);
+      }
+
+      if (mode === "quick") {
+        closeQuickReport();
+      }
+      return;
+    }
 
     await reportSetResult({
       apiToken: config.apiToken,
       setId: editorSet.setId,
       winnerId,
-      gameData: gameData.length ? gameData : null,
+      gameData: gameDataPayload,
     });
 
     setSuccess(`Reported set ${editorSet.setId} to start.gg.`);
@@ -497,7 +747,30 @@ async function submitSet(editorSet, mode) {
       await writeOverlayFromStreamSet(true);
     }
 
-    await refreshTournament();
+    const bucketBeforeRefresh = bucketId
+      ? tournamentData.value.buckets.find((bucket) => bucket.id === bucketId)
+      : null;
+
+    await fetchAndApplyTournamentData();
+
+    // The bucket this set belonged to has vanished from the fresh fetch -
+    // start.gg's cache hasn't caught up with the pool/bracket this report
+    // just started. Keep showing it (with this result applied) and start
+    // retrying in the background instead of letting it just disappear. This
+    // has to happen *before* finishTournamentRefresh resolves the active
+    // tab below, or that fallback runs against a bucket list that still
+    // looks like it's missing and jumps away right as this reinjects it.
+    if (
+      bucketId &&
+      bucketBeforeRefresh &&
+      !tournamentData.value?.buckets?.some((bucket) => bucket.id === bucketId)
+    ) {
+      const snapshot = cloneBucket(bucketBeforeRefresh);
+      applyOptimisticResult(snapshot, editorSet.setId, editorSet, winnerId);
+      registerPendingBucket(bucketId, snapshot);
+    }
+
+    await finishTournamentRefresh();
 
     if (mode === "quick") {
       closeQuickReport();
@@ -521,6 +794,21 @@ watch(
 watch(
   () => config.autoWriteOverlay,
   () => scheduleOverlayWrite(),
+);
+
+// Pending bucket-sync state (and its retry timer) is only meaningful for
+// whichever tournament it was created against - drop it if the user points
+// this app at a different tournament or token, so a stale snapshot/retry
+// from the old one can't leak into the new one's data.
+watch(
+  () => [config.apiToken, config.tournamentSlug],
+  () => {
+    bucketSync.clear();
+    if (bucketSyncRetryTimer) {
+      clearTimeout(bucketSyncRetryTimer);
+      bucketSyncRetryTimer = null;
+    }
+  },
 );
 
 onMounted(async () => {
@@ -552,6 +840,9 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (overlayTimer) {
     clearTimeout(overlayTimer);
+  }
+  if (bucketSyncRetryTimer) {
+    clearTimeout(bucketSyncRetryTimer);
   }
 });
 
@@ -642,6 +933,7 @@ const showError = computed(() => Boolean(errorMessage.value));
     <BracketBoard
       :tournament-data="tournamentData"
       :active-bucket-id="activeBucketId"
+      :bucket-sync-state="bucketSync"
       @update:activeBucketId="onBucketChange"
       @set-on-stream="loadStreamSetFromTournamentSet"
       @quick-report="openQuickReport"

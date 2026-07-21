@@ -53,7 +53,7 @@ struct FetchTournamentRequest {
 #[serde(rename_all = "camelCase")]
 struct ReportSetRequest {
     api_token: String,
-    set_id: u64,
+    set_id: String,
     winner_id: u64,
     game_data: Option<Vec<GameDataInput>>,
 }
@@ -154,7 +154,7 @@ struct SetBucket {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TournamentSet {
-    id: u64,
+    id: String,
     identifier: Option<String>,
     round_text: String,
     round: i32,
@@ -201,7 +201,7 @@ struct EntrantSlot {
     /// Where this slot's competitor comes from: "set", "seed", "bye", etc.
     source_type: Option<String>,
     /// The originating set ID when `source_type` is "set".
-    source_set_id: Option<u64>,
+    source_set_id: Option<String>,
     /// 1 = winner of the source set advances here, 2 = loser advances here.
     source_placement: Option<i32>,
 }
@@ -221,6 +221,18 @@ fn parse_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
+// Set ids are usually plain numbers, but start.gg gives sets in a "preview"
+// bracket (seeded but not yet started by the TO) synthetic string ids like
+// "preview_3393165_1_0" instead - parsing those as u64 fails and silently
+// drops every set in the bracket, so set ids are kept as opaque strings
+// rather than numbers.
+fn parse_id_string(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return (!s.is_empty()).then(|| s.to_string());
+    }
+    value.as_u64().map(|n| n.to_string())
+}
+
 fn parse_i32(value: &Value) -> Option<i32> {
     value
         .as_i64()
@@ -235,10 +247,10 @@ fn read_text(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
-fn default_slot(label: &str) -> EntrantSlot {
+fn default_slot() -> EntrantSlot {
     EntrantSlot {
         entrant_id: None,
-        name: label.to_string(),
+        name: String::new(),
         score: 0,
         source_type: None,
         source_set_id: None,
@@ -246,9 +258,13 @@ fn default_slot(label: &str) -> EntrantSlot {
     }
 }
 
-fn parse_slot(slot: Option<&Value>, fallback_name: &str) -> EntrantSlot {
+// Leaves `name` empty when there's no real entrant rather than defaulting
+// to "Player 1"/"Player 2" - those defaults were indistinguishable from a
+// real name once they reached the frontend, which masked its own "TBD" /
+// "Winner of Match N" placeholder logic for undetermined slots.
+fn parse_slot(slot: Option<&Value>) -> EntrantSlot {
     let Some(slot) = slot else {
-        return default_slot(fallback_name);
+        return default_slot();
     };
 
     let entrant = slot.get("entrant").unwrap_or(&Value::Null);
@@ -270,7 +286,7 @@ fn parse_slot(slot: Option<&Value>, fallback_name: &str) -> EntrantSlot {
         .filter(|v| !v.is_empty());
 
     let source_set_id = if source_type.as_deref() == Some("set") {
-        slot.get("prereqId").and_then(parse_u64)
+        slot.get("prereqId").and_then(parse_id_string)
     } else {
         None
     };
@@ -279,11 +295,7 @@ fn parse_slot(slot: Option<&Value>, fallback_name: &str) -> EntrantSlot {
 
     EntrantSlot {
         entrant_id,
-        name: if name.is_empty() {
-            fallback_name.to_string()
-        } else {
-            name
-        },
+        name,
         score,
         source_type,
         source_set_id,
@@ -529,7 +541,11 @@ fn resolve_sets_pointers(data: &Value, locations: &[SetsLocation<'_>]) -> Vec<St
                 array_pointer,
                 sets_relative,
             } => {
-                if let Some(len) = data.pointer(array_pointer).and_then(Value::as_array).map(Vec::len) {
+                if let Some(len) = data
+                    .pointer(array_pointer)
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                {
                     for i in 0..len {
                         out.push(format!("{array_pointer}/{i}{sets_relative}"));
                     }
@@ -538,6 +554,49 @@ fn resolve_sets_pointers(data: &Value, locations: &[SetsLocation<'_>]) -> Vec<St
         }
     }
     out
+}
+
+fn has_any_sets(data: &Value, locations: &[SetsLocation<'_>]) -> bool {
+    resolve_sets_pointers(data, locations)
+        .iter()
+        .any(|pointer| {
+            data.pointer(&format!("{pointer}/nodes"))
+                .and_then(Value::as_array)
+                .map(|nodes| !nodes.is_empty())
+                .unwrap_or(false)
+        })
+}
+
+// Tries each (query, variables) pair in order, moving to the next not just
+// on an outright error but also when a query succeeds with zero sets -
+// start.gg's default (unfiltered) query can legitimately come back empty
+// for a bracket where nothing has been reported yet (e.g. a freshly seeded
+// event), while an explicit `filters: { state: [...] }` variant that asks
+// for "not started" sets too still finds them. If every tier comes back
+// empty rather than erroring, that's trusted as the real answer (the event
+// genuinely has no sets yet) rather than treated as a failure.
+async fn fetch_best_sets_payload(
+    api_token: &str,
+    attempts: Vec<(&str, Value)>,
+    per_page: u32,
+    locations: &[SetsLocation<'_>],
+) -> Result<Value, String> {
+    let mut empty_result: Option<Value> = None;
+    let mut errors = Vec::new();
+
+    for (query, variables) in attempts {
+        match fetch_paginated(api_token, query, variables, per_page, locations).await {
+            Ok(data) => {
+                if has_any_sets(&data, locations) {
+                    return Ok(data);
+                }
+                empty_result.get_or_insert(data);
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    empty_result.ok_or_else(|| errors.join(" | "))
 }
 
 // Runs `query` with `page`/`perPage` (plus whatever else is already in
@@ -741,7 +800,7 @@ fn parse_set_nodes(
     };
 
     for node in nodes {
-        let set_id = parse_u64(node.get("id").unwrap_or(&Value::Null));
+        let set_id = parse_id_string(node.get("id").unwrap_or(&Value::Null));
         let Some(set_id) = set_id else {
             continue;
         };
@@ -770,9 +829,7 @@ fn parse_set_nodes(
             .map(str::to_string)
             .filter(|v| !v.is_empty());
 
-        let phase_group_id = phase_group
-            .and_then(|pg| pg.get("id"))
-            .and_then(parse_u64);
+        let phase_group_id = phase_group.and_then(|pg| pg.get("id")).and_then(parse_u64);
 
         let phase_group_identifier = phase_group
             .and_then(|pg| pg.get("displayIdentifier"))
@@ -786,8 +843,8 @@ fn parse_set_nodes(
             .cloned()
             .unwrap_or_default();
 
-        let player1 = parse_slot(slots.first(), "Player 1");
-        let player2 = parse_slot(slots.get(1), "Player 2");
+        let player1 = parse_slot(slots.first());
+        let player2 = parse_slot(slots.get(1));
 
         let character_data = parse_set_character_data(node);
         let resolve_id = |character_id: Option<&u64>| {
@@ -806,10 +863,14 @@ fn parse_set_nodes(
                 game_num: game.order,
                 winner_entrant_id: game.winner_entrant_id,
                 player1_character: resolve_id(
-                    player1.entrant_id.and_then(|id| game.character_picks.get(&id)),
+                    player1
+                        .entrant_id
+                        .and_then(|id| game.character_picks.get(&id)),
                 ),
                 player2_character: resolve_id(
-                    player2.entrant_id.and_then(|id| game.character_picks.get(&id)),
+                    player2
+                        .entrant_id
+                        .and_then(|id| game.character_picks.get(&id)),
                 ),
             })
             .collect();
@@ -818,8 +879,21 @@ fn parse_set_nodes(
         let winner_id = parse_u64(node.get("winnerId").unwrap_or(&Value::Null));
         let round = parse_i32(node.get("round").unwrap_or(&Value::Null)).unwrap_or(0);
 
+        // Once a set has a real reported score, that's the best evidence of
+        // its actual best-of. Before that, default by context instead of
+        // always guessing 3: round-robin pools are conventionally best of
+        // 3, elimination bracket sets best of 5.
         let max_score = player1.score.max(player2.score);
-        let best_of = if max_score >= 3 { 5 } else { 3 };
+        let phase_name_lower = phase_name.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let looks_like_pool_set =
+            round == 0 || phase_name_lower.contains("pool") || phase_name_lower.contains("group");
+        let best_of = if max_score >= 3 {
+            5
+        } else if looks_like_pool_set {
+            3
+        } else {
+            5
+        };
 
         out.push(TournamentSet {
             id: set_id,
@@ -866,10 +940,10 @@ fn push_sets_to_buckets(
     sets: Vec<TournamentSet>,
     all_sets: &mut Vec<TournamentSet>,
     grouped: &mut Vec<GroupedBucket>,
-    seen_set_ids: &mut HashSet<u64>,
+    seen_set_ids: &mut HashSet<String>,
 ) {
     for set in sets {
-        if !seen_set_ids.insert(set.id) {
+        if !seen_set_ids.insert(set.id.clone()) {
             continue;
         }
 
@@ -900,7 +974,9 @@ fn parse_videogame_id(value: Option<&Value>) -> Option<u64> {
 // parsing, so the character list can be fetched and threaded into
 // parse_tournament_payload/parse_event_payload up front.
 fn peek_tournament_videogame_id(data: &Value) -> Option<u64> {
-    let events = data.pointer("/tournament/events").and_then(Value::as_array)?;
+    let events = data
+        .pointer("/tournament/events")
+        .and_then(Value::as_array)?;
     events
         .iter()
         .find_map(|event| parse_videogame_id(event.get("videogame")))
@@ -920,52 +996,82 @@ fn build_tournament_data(
 ) -> TournamentData {
     let total_sets = all_sets.len();
 
-    // Count how many phase groups share the same (event, phase) so a
-    // single-group phase (or a bracket, which normally has just one group)
-    // doesn't get a redundant "Pool N" suffix - only actual multi-pool
-    // phases do.
-    let mut phase_group_counts: HashMap<(String, String), usize> = HashMap::new();
-    for bucket in &grouped {
-        if let Some(first) = bucket.sets.first() {
-            let phase = first.phase_name.clone().unwrap_or_default();
-            *phase_group_counts
-                .entry((first.event_name.clone(), phase))
-                .or_insert(0) += 1;
-        }
+    // A bucket is a round-robin pool if none of its sets carry a bracket
+    // round (round 0 everywhere); anything else - a single/double
+    // elimination bracket, grand final, etc. - sorts ahead of every pool
+    // within the same event, with pools after it in pool-number order.
+    // Sorted by event first so a multi-event tournament keeps each event's
+    // bracket+pools together rather than interleaving them.
+    struct BucketSortKey {
+        event_name: String,
+        is_pool: bool,
+        pool_number: Option<u64>,
+        label: String,
     }
 
-    let mut buckets = Vec::new();
+    let mut buckets_with_keys: Vec<(SetBucket, BucketSortKey)> = Vec::new();
     for bucket in grouped {
         let Some(first) = bucket.sets.first() else {
             continue;
         };
 
-        let phase = first.phase_name.clone();
-        let base_name = if let Some(phase) = &phase {
-            format!("{} - {}", first.event_name, phase)
+        // Two independent signals, since neither is guaranteed alone: sets
+        // in a round-robin pool don't carry a bracket round, and start.gg's
+        // own phase naming convention for these is "Pools"/"Pool"/"Groups".
+        let phase_name_lower = first
+            .phase_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_pool = bucket.sets.iter().all(|set| set.round == 0)
+            || phase_name_lower.contains("pool")
+            || phase_name_lower.contains("group");
+        let pool_label = first
+            .phase_group_identifier
+            .clone()
+            .unwrap_or_else(|| "?".to_string());
+
+        let name = if is_pool {
+            format!("{} - Pool {pool_label}", first.event_name)
+        } else if let Some(phase) = &first.phase_name {
+            format!("{} - {phase}", first.event_name)
         } else {
             first.event_name.clone()
         };
 
-        let phase_key = (first.event_name.clone(), phase.clone().unwrap_or_default());
-        let group_count = phase_group_counts.get(&phase_key).copied().unwrap_or(1);
-
-        let name = if group_count > 1 {
-            let pool_label = first
-                .phase_group_identifier
-                .clone()
-                .unwrap_or_else(|| "?".to_string());
-            format!("{base_name} Pool {pool_label}")
-        } else {
-            base_name
+        let sort_key = BucketSortKey {
+            event_name: first.event_name.clone(),
+            is_pool,
+            pool_number: pool_label.parse::<u64>().ok(),
+            label: pool_label,
         };
 
-        buckets.push(SetBucket {
-            id: normalize_bucket_id(&bucket.key),
-            name,
-            sets: bucket.sets,
-        });
+        buckets_with_keys.push((
+            SetBucket {
+                id: normalize_bucket_id(&bucket.key),
+                name,
+                sets: bucket.sets,
+            },
+            sort_key,
+        ));
     }
+
+    buckets_with_keys.sort_by(|(_, a), (_, b)| {
+        a.event_name
+            .cmp(&b.event_name)
+            .then_with(|| a.is_pool.cmp(&b.is_pool))
+            .then_with(|| match (a.pool_number, b.pool_number) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.label.cmp(&b.label),
+            })
+    });
+
+    let buckets: Vec<SetBucket> = buckets_with_keys
+        .into_iter()
+        .map(|(bucket, _)| bucket)
+        .collect();
 
     TournamentData {
         tournament_id,
@@ -1005,7 +1111,7 @@ fn parse_tournament_payload(
 
     let mut grouped: Vec<GroupedBucket> = Vec::new();
     let mut all_sets: Vec<TournamentSet> = Vec::new();
-    let mut seen_set_ids: HashSet<u64> = HashSet::new();
+    let mut seen_set_ids: HashSet<String> = HashSet::new();
     let mut videogame_id: Option<u64> = None;
 
     for event in events {
@@ -1064,7 +1170,7 @@ fn parse_event_payload(
 
     let mut grouped: Vec<GroupedBucket> = Vec::new();
     let mut all_sets: Vec<TournamentSet> = Vec::new();
-    let mut seen_set_ids: HashSet<u64> = HashSet::new();
+    let mut seen_set_ids: HashSet<String> = HashSet::new();
 
     let direct_sets = parse_set_nodes(&event_name, direct_nodes, character_names);
     push_sets_to_buckets(direct_sets, &mut all_sets, &mut grouped, &mut seen_set_ids);
@@ -1309,24 +1415,15 @@ async fn fetch_tournament_payload(
         sets_relative: "/sets",
     }];
 
-    match fetch_paginated(api_token, primary_query, base_variables.clone(), per_page, &locations).await {
-        Ok(data) => Ok(data),
-        Err(primary_error) => {
-            match fetch_paginated(api_token, filtered_query, filtered_variables, per_page, &locations).await {
-                Ok(data) => Ok(data),
-                Err(filtered_error) => {
-                    let fallback =
-                        fetch_paginated(api_token, fallback_query, base_variables, per_page, &locations).await;
-                    match fallback {
-                    Ok(data) => Ok(data),
-                    Err(fallback_error) => Err(format!(
-                        "Failed to fetch tournament data. Primary query error: {primary_error}. Filtered query error: {filtered_error}. Fallback query error: {fallback_error}"
-                    )),
-                }
-                }
-            }
-        }
-    }
+    let attempts = vec![
+        (primary_query, base_variables.clone()),
+        (filtered_query, filtered_variables),
+        (fallback_query, base_variables),
+    ];
+
+    fetch_best_sets_payload(api_token, attempts, per_page, &locations)
+        .await
+        .map_err(|e| format!("Failed to fetch tournament data. {e}"))
 }
 
 async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Result<Value, String> {
@@ -1535,28 +1632,15 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
         sets_relative: "/sets",
     }];
 
-    let mut data = match fetch_paginated(api_token, primary_query, base_variables.clone(), per_page, &locations)
+    let attempts = vec![
+        (primary_query, base_variables.clone()),
+        (filtered_query, filtered_variables),
+        (fallback_query, base_variables),
+    ];
+
+    let mut data = fetch_best_sets_payload(api_token, attempts, per_page, &locations)
         .await
-    {
-        Ok(data) => data,
-        Err(primary_error) => {
-            match fetch_paginated(api_token, filtered_query, filtered_variables, per_page, &locations).await {
-                Ok(data) => data,
-                Err(filtered_error) => {
-                    let fallback =
-                        fetch_paginated(api_token, fallback_query, base_variables, per_page, &locations).await;
-                    match fallback {
-                        Ok(data) => data,
-                        Err(fallback_error) => {
-                            return Err(format!(
-                                "Failed to fetch event data. Primary query error: {primary_error}. Filtered query error: {filtered_error}. Fallback query error: {fallback_error}"
-                            ))
-                        }
-                    }
-                }
-            }
-        }
-    };
+        .map_err(|e| format!("Failed to fetch event data. {e}"))?;
 
     // Most events expose sets directly. Phase-group-level sets are only a
     // fallback for the (rarer) events that don't, and can mean fetching many
@@ -1584,7 +1668,11 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
 // paginated independently. Kept separate from the main event query (rather
 // than requested alongside it every time) since it's only needed as a
 // fallback and can otherwise multiply request count by the number of pools.
-async fn fetch_event_phase_group_sets(api_token: &str, slug: &str, per_page: u32) -> Result<Value, String> {
+async fn fetch_event_phase_group_sets(
+    api_token: &str,
+    slug: &str,
+    per_page: u32,
+) -> Result<Value, String> {
     let query = r#"
         query EventPhaseGroupSets($slug: String!, $perPage: Int!, $page: Int!) {
           event(slug: $slug) {
@@ -1648,7 +1736,14 @@ async fn fetch_event_phase_group_sets(api_token: &str, slug: &str, per_page: u32
         sets_relative: "/sets",
     }];
 
-    let data = fetch_paginated(api_token, query, json!({ "slug": slug }), per_page, &locations).await?;
+    let data = fetch_paginated(
+        api_token,
+        query,
+        json!({ "slug": slug }),
+        per_page,
+        &locations,
+    )
+    .await?;
 
     Ok(data
         .pointer("/event/phaseGroups")
@@ -1698,12 +1793,11 @@ async fn fetch_tournament_state(request: FetchTournamentRequest) -> Result<Tourn
     if let Some(event_slug) = normalized_event_slug {
         match fetch_event_payload(&request.api_token, &event_slug, per_page).await {
             Ok(event_data) => {
-                let event_characters = character_name_map(
-                    &request.api_token,
-                    peek_event_videogame_id(&event_data),
-                )
-                .await;
-                let parsed_event = parse_event_payload(&event_data, &event_slug, &event_characters)?;
+                let event_characters =
+                    character_name_map(&request.api_token, peek_event_videogame_id(&event_data))
+                        .await;
+                let parsed_event =
+                    parse_event_payload(&event_data, &event_slug, &event_characters)?;
 
                 if parsed_event.total_sets > 0 {
                     return Ok(parsed_event);
@@ -1859,7 +1953,10 @@ fn best_image_url(images: Option<&Vec<Value>>) -> Option<String> {
         .iter()
         .find(|img| img.get("type").and_then(Value::as_str) == Some("profile"))
         .or_else(|| images.first())?;
-    chosen.get("url").and_then(Value::as_str).map(str::to_string)
+    chosen
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 // Picks the participant's profile picture: prefer one explicitly typed
@@ -1939,8 +2036,12 @@ async fn fetch_entrant_avatars(request: FetchAvatarsRequest) -> Result<EntrantAv
     let urls = fetch_entrant_avatar_urls(&request.api_token, &entrant_ids).await;
 
     Ok(EntrantAvatars {
-        player1_avatar: request.player1_entrant_id.and_then(|id| urls.get(&id).cloned()),
-        player2_avatar: request.player2_entrant_id.and_then(|id| urls.get(&id).cloned()),
+        player1_avatar: request
+            .player1_entrant_id
+            .and_then(|id| urls.get(&id).cloned()),
+        player2_avatar: request
+            .player2_entrant_id
+            .and_then(|id| urls.get(&id).cloned()),
     })
 }
 
@@ -1950,7 +2051,7 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
         return Err("Missing start.gg API token".to_string());
     }
 
-    if request.set_id == 0 {
+    if request.set_id.trim().is_empty() {
         return Err("Invalid set ID".to_string());
     }
 
@@ -2103,7 +2204,9 @@ fn character_asset(out_dir: Option<&Path>, icon: Option<&str>) -> Option<Value> 
 //
 // Only `online_avatar` (a direct start.gg URL) is populated, not the
 // local-file `avatar` field - layouts that render both would otherwise show
-// the same profile picture twice.
+// the same profile picture twice. (A locally staged copy under a fixed
+// filename was tried and reverted - it could serve a stale cached image for
+// the previous set instead of the current one.)
 fn player_payload(player: &OverlayPlayer, out_dir: Option<&Path>) -> Value {
     json!({
         "name": player.name,
@@ -2213,7 +2316,8 @@ fn disable_gstreamer_pipewire_plugin() {
     filtered_dir.pop();
     filtered_dir.push("gst-plugins");
 
-    let Ok(entries) = fs::create_dir_all(&filtered_dir).and_then(|_| fs::read_dir(source_dir)) else {
+    let Ok(entries) = fs::create_dir_all(&filtered_dir).and_then(|_| fs::read_dir(source_dir))
+    else {
         return;
     };
 
@@ -2261,7 +2365,8 @@ pub fn run() {
                 if let Some(main_webview) = _app.get_webview_window("main") {
                     main_webview.with_webview(|webview| {
                         use webkit2gtk::{
-                            glib::Cast, PermissionRequestExt, UserMediaPermissionRequest, WebViewExt,
+                            glib::Cast, PermissionRequestExt, UserMediaPermissionRequest,
+                            WebViewExt,
                         };
 
                         webview.inner().connect_permission_request(|_, request| {

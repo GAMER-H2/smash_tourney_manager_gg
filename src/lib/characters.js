@@ -2,6 +2,7 @@
 // (as datamined from the game itself), not the English display names -
 // e.g. Bowser -> "koopa", Jigglypuff -> "purin", Villager -> "murabito".
 const CHARACTER_ICON_FILES = {
+  Random: "random",
   Mario: "mario",
   "Donkey Kong": "donkey",
   Link: "link",

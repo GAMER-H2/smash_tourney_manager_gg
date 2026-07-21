@@ -17,8 +17,21 @@ function sortColumn(sets) {
   return [...sets].sort((a, b) => {
     const byIdentifier = naturalCompare(a.identifier, b.identifier);
     if (byIdentifier !== 0) return byIdentifier;
-    return a.id - b.id;
+    // Set ids are usually numeric, but start.gg gives sets in a "preview"
+    // bracket (seeded but not yet started) non-numeric ids like
+    // "preview_3393165_1_0" - compare as strings so those still sort
+    // consistently instead of every pair coming out NaN.
+    return naturalCompare(a.id, b.id);
   });
+}
+
+// Two independent signals, since neither is guaranteed alone: round-robin
+// pool sets don't carry a bracket round, and start.gg's own phase naming
+// convention for these is "Pools"/"Pool"/"Groups".
+function looksLikePool(sets) {
+  const allRoundsZero = sets.every((set) => Number(set.round) === 0);
+  const phaseName = (sets.find((set) => set.phaseName)?.phaseName || "").toLowerCase();
+  return allRoundsZero || phaseName.includes("pool") || phaseName.includes("group");
 }
 
 function columnLabel(sets, fallback) {
@@ -79,7 +92,7 @@ function buildEdges(sets) {
 
 export function buildBracketLayout(rawSets) {
   const sets = rawSets || [];
-  const isBracket = sets.some((set) => Number(set.round) !== 0);
+  const isBracket = sets.length > 0 && !looksLikePool(sets);
 
   if (!isBracket) {
     return { isBracket: false, winners: [], losers: [], grandFinal: [], edges: [] };
