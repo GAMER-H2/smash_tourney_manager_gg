@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue"
 import WebcamPanel from "./components/WebcamPanel.vue";
 import SetEditor from "./components/SetEditor.vue";
 import BracketBoard from "./components/BracketBoard.vue";
+import { collapseByeSets } from "./lib/bracket-utils";
 import {
   fetchEntrantAvatars,
   fetchGameCharacters,
@@ -567,7 +568,24 @@ async function fetchAndApplyTournamentData() {
   });
 
   canonicalizeFetchedCharacters(data);
+  collapseBucketByes(data);
   tournamentData.value = data;
+  return data;
+}
+
+// Fold start.gg's structural bye/passthrough sets out of every bracket bucket
+// up front, rewriting drop links to point at real matches (see collapseByeSets
+// in bracket-utils). Doing it here, on the stored data, means the bracket view
+// *and* optimistic routing during a desync both see the same collapsed graph -
+// so a reported Winners Round 1 result advances its loser straight into the
+// real Losers Round 1 slot instead of a bye set that never renders. Pools
+// (all-round-0) carry no such sets, so they pass through untouched.
+function collapseBucketByes(data) {
+  for (const bucket of data?.buckets ?? []) {
+    if ((bucket.sets ?? []).some((set) => Number(set.round) !== 0)) {
+      bucket.sets = collapseByeSets(bucket.sets);
+    }
+  }
   return data;
 }
 

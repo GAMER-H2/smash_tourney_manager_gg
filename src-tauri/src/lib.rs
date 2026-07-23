@@ -1221,7 +1221,7 @@ async fn fetch_tournament_payload(
               videogame {
                 id
               }
-              sets(page: $page, perPage: $perPage) {
+              sets(page: $page, perPage: $perPage, filters: { hideEmpty: false, showByes: true }) {
                 pageInfo {
                   totalPages
                 }
@@ -1358,7 +1358,7 @@ async fn fetch_tournament_payload(
               videogame {
                 id
               }
-              sets(page: $page, perPage: $perPage) {
+              sets(page: $page, perPage: $perPage, filters: { hideEmpty: false, showByes: true }) {
                 pageInfo {
                   totalPages
                 }
@@ -1439,7 +1439,7 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
             videogame {
               id
             }
-            sets(page: $page, perPage: $perPage) {
+            sets(page: $page, perPage: $perPage, filters: { hideEmpty: false, showByes: true }) {
               pageInfo {
                 totalPages
               }
@@ -1576,7 +1576,7 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
             videogame {
               id
             }
-            sets(page: $page, perPage: $perPage) {
+            sets(page: $page, perPage: $perPage, filters: { hideEmpty: false, showByes: true }) {
               pageInfo {
                 totalPages
               }
@@ -1678,7 +1678,7 @@ async fn fetch_event_phase_group_sets(
           event(slug: $slug) {
             phaseGroups {
               id
-              sets(page: $page, perPage: $perPage) {
+              sets(page: $page, perPage: $perPage, filters: { hideEmpty: false, showByes: true }) {
                 pageInfo {
                   totalPages
                 }

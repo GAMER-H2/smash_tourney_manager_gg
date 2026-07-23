@@ -39,6 +39,67 @@ function columnLabel(sets, fallback) {
   return withText?.roundText || fallback;
 }
 
+function slotIsBye(slot) {
+  return slot?.sourceType === "bye";
+}
+
+// A "bye set" is start.gg's structural passthrough: a real entrant (or
+// another passthrough) versus an empty bye slot, so it just forwards one
+// player onward without ever being a played match. They only appear in the
+// payload when fetched with showByes, and we never want to render them as
+// their own (empty) columns.
+function isByeSet(set) {
+  return slotIsBye(set?.player1) || slotIsBye(set?.player2);
+}
+
+// start.gg brackets with byes route the meaningful drop links *through* these
+// passthrough sets - e.g. a Winners Round 1 loser only reaches the first real
+// Losers Round 1 match via a couple of bye sets in between. This collapses
+// that: every real (non-bye) set is kept, but any slot that sources a bye set
+// is rewritten to point straight at the nearest real ancestor match and its
+// winner/loser placement, and the bye sets themselves are dropped. The result
+// is that a real card can say "Loser of Match A" instead of a vague
+// placeholder, and optimistic routing during a desync can advance that loser
+// straight into the right slot - both using the same source pointers they
+// already rely on, so no other logic changes.
+export function collapseByeSets(rawSets) {
+  const sets = rawSets || [];
+  if (!sets.some(isByeSet)) return sets;
+
+  const byId = new Map(sets.map((set) => [set.id, set]));
+
+  // Resolve a (sourceSetId, placement) reference down to the nearest real
+  // match. Walks through bye sets by following whichever of their slots
+  // carries a real "set" source (a bye's winner is just that lone entrant).
+  // Returns the original reference for a real/missing source, or null when the
+  // chain dead-ends in a fixed seed / empty bye (nothing real to point at).
+  function resolveReal(sourceSetId, placement, guard = 0) {
+    const source = byId.get(sourceSetId);
+    if (!source || !isByeSet(source)) return { sourceSetId, placement };
+    if (guard > 64) return null; // guard against a malformed cycle
+    const feeder = [source.player1, source.player2].find(
+      (slot) => slot?.sourceType === "set" && slot?.sourceSetId,
+    );
+    if (!feeder) return null;
+    return resolveReal(feeder.sourceSetId, feeder.sourcePlacement, guard + 1);
+  }
+
+  function rewriteSlot(slot) {
+    if (slot?.sourceType !== "set" || !slot?.sourceSetId) return slot;
+    const resolved = resolveReal(slot.sourceSetId, slot.sourcePlacement);
+    if (!resolved || resolved.sourceSetId === slot.sourceSetId) return slot;
+    return { ...slot, sourceSetId: resolved.sourceSetId, sourcePlacement: resolved.placement };
+  }
+
+  return sets
+    .filter((set) => !isByeSet(set))
+    .map((set) => ({
+      ...set,
+      player1: rewriteSlot(set.player1),
+      player2: rewriteSlot(set.player2),
+    }));
+}
+
 function buildSlotLookups(sets) {
   const byId = new Map(sets.map((set) => [set.id, set]));
 
@@ -47,11 +108,15 @@ function buildSlotLookups(sets) {
       return { ...slot, placeholder: null };
     }
 
-    if (slot?.sourceType === "set" && slot?.sourceSetId && byId.has(slot.sourceSetId)) {
-      const source = byId.get(slot.sourceSetId);
-      const sourceLabel = source.identifier ? `Match ${source.identifier}` : `Set ${source.id}`;
+    if (slot?.sourceType === "set" && slot?.sourceSetId) {
       const verb = slot.sourcePlacement === 2 ? "Loser" : "Winner";
-      return { ...slot, placeholder: `${verb} of ${sourceLabel}` };
+      const source = byId.get(slot.sourceSetId);
+      // The source set is sometimes missing from this same bucket's data
+      // (seen specifically for losers round 1, which drops in from winners
+      // round 1) - we still know it's a winner/loser drop even without a
+      // specific match to name, so say that instead of a bare "TBD".
+      const sourceLabel = source ? (source.identifier ? `Match ${source.identifier}` : `Set ${source.id}`) : null;
+      return { ...slot, placeholder: sourceLabel ? `${verb} of ${sourceLabel}` : `${verb} of an earlier match` };
     }
 
     if (slot?.sourceType === "bye") {
@@ -91,7 +156,7 @@ function buildEdges(sets) {
 }
 
 export function buildBracketLayout(rawSets) {
-  const sets = rawSets || [];
+  const sets = collapseByeSets(rawSets || []);
   const isBracket = sets.length > 0 && !looksLikePool(sets);
 
   if (!isBracket) {
