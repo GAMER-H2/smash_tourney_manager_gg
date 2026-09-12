@@ -19,6 +19,19 @@ const props = defineProps({
     type: Object,
     default: () => new Map(),
   },
+  // Set<setId> of sets holding a locally-saved result that hasn't been
+  // submitted to start.gg yet, so they can be flagged on the bracket.
+  draftedSetIds: {
+    type: Object,
+    default: () => new Set(),
+  },
+  // Map<setId, { display, running }> - live set clocks for sets that are
+  // under way, so the board shows which matches are in progress and how long
+  // they've been going, the way start.gg's own bracket does.
+  setTimers: {
+    type: Object,
+    default: () => new Map(),
+  },
 });
 
 const emit = defineEmits(["update:activeBucketId", "set-on-stream", "quick-report"]);
@@ -62,6 +75,29 @@ function onSetClick(set, event) {
   if (activeBucketLocked.value) return;
   emit(event, set);
 }
+
+function hasDraft(set) {
+  return props.draftedSetIds.has?.(String(set?.id)) ?? false;
+}
+
+function setTimer(set) {
+  return props.setTimers.get?.(String(set?.id)) ?? null;
+}
+
+const runningSetCount = computed(
+  () => (activeBucket.value?.sets ?? []).filter((set) => setTimer(set)?.running).length,
+);
+
+// start.gg scores a disqualified entrant -1; show that as "DQ" rather than
+// as a negative number nobody would read as a forfeit.
+function slotScore(slot) {
+  return Number(slot?.score) === -1 ? "DQ" : slot?.score;
+}
+
+const draftCount = computed(
+  () =>
+    (activeBucket.value?.sets ?? []).filter((set) => hasDraft(set)).length,
+);
 
 function isWinnerSlot(set, slot) {
   return Boolean(set.winnerId && slot?.entrantId && slot.entrantId === set.winnerId);
@@ -182,6 +218,9 @@ watch(
       </div>
       <p class="summary" v-if="tournamentData">
         {{ tournamentData.tournamentName }} • {{ tournamentData.totalSets }} sets
+        <span v-if="runningSetCount" class="summary-live">
+          • {{ runningSetCount }} in progress
+        </span>
       </p>
     </header>
 
@@ -192,6 +231,11 @@ watch(
     <p v-else-if="activeBucketSync" class="notice notice-syncing">
       Waiting for start.gg to catch up on "{{ activeBucket.name }}" - reports made here are being
       saved locally and will sync automatically once it reloads.
+    </p>
+    <p v-if="draftCount" class="notice notice-draft">
+      {{ draftCount }} set{{ draftCount === 1 ? "" : "s" }} here
+      {{ draftCount === 1 ? "has" : "have" }} a locally-saved result that hasn't been submitted to
+      start.gg yet - open {{ draftCount === 1 ? "it" : "them" }} and submit when ready.
     </p>
     <p v-else-if="activeBucketPoolComplete" class="notice notice-info">
       This pool is complete - remember to finalize placements on start.gg when convenient.
@@ -223,9 +267,15 @@ watch(
             <h3>{{ col.label }}</h3>
             <div v-for="set in col.sets" :key="set.id" class="match-row">
               <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
+              <span v-if="hasDraft(set)" class="draft-badge" title="Saved locally, not submitted">●</span>
               <article
                 class="match-card"
-                :class="{ locked: activeBucketLocked }"
+                :class="{
+                  locked: activeBucketLocked,
+                  drafted: hasDraft(set),
+                  'in-progress': setTimer(set)?.running,
+                }"
+                :title="hasDraft(set) ? 'Has a locally-saved result not yet submitted to start.gg' : ''"
                 :ref="(el) => setCardRef(set.id, el)"
                 @click="onSetClick(set, 'quick-report')"
                 @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
@@ -247,7 +297,7 @@ watch(
                     </template>
                     <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
                   </span>
-                  <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
+                  <span v-if="!set.player1.placeholder" class="slot-score">{{ slotScore(set.player1) }}</span>
                 </div>
                 <div
                   class="slot-row"
@@ -266,7 +316,15 @@ watch(
                     </template>
                     <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
                   </span>
-                  <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
+                  <span v-if="!set.player2.placeholder" class="slot-score">{{ slotScore(set.player2) }}</span>
+                </div>
+                <div
+                  v-if="setTimer(set)"
+                  class="match-timer"
+                  :class="{ running: setTimer(set).running }"
+                  :title="setTimer(set).running ? 'Set in progress' : 'Set started, timer paused'"
+                >
+                  {{ setTimer(set).running ? "▶" : "⏸" }} {{ setTimer(set).display }}
                 </div>
               </article>
             </div>
@@ -278,9 +336,15 @@ watch(
             <h3>{{ col.label }}</h3>
             <div v-for="set in col.sets" :key="set.id" class="match-row">
               <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
+              <span v-if="hasDraft(set)" class="draft-badge" title="Saved locally, not submitted">●</span>
               <article
                 class="match-card"
-                :class="{ locked: activeBucketLocked }"
+                :class="{
+                  locked: activeBucketLocked,
+                  drafted: hasDraft(set),
+                  'in-progress': setTimer(set)?.running,
+                }"
+                :title="hasDraft(set) ? 'Has a locally-saved result not yet submitted to start.gg' : ''"
                 :ref="(el) => setCardRef(set.id, el)"
                 @click="onSetClick(set, 'quick-report')"
                 @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
@@ -302,7 +366,7 @@ watch(
                     </template>
                     <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
                   </span>
-                  <span v-if="!set.player1.placeholder" class="slot-score">{{ set.player1.score }}</span>
+                  <span v-if="!set.player1.placeholder" class="slot-score">{{ slotScore(set.player1) }}</span>
                 </div>
                 <div
                   class="slot-row"
@@ -321,7 +385,15 @@ watch(
                     </template>
                     <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
                   </span>
-                  <span v-if="!set.player2.placeholder" class="slot-score">{{ set.player2.score }}</span>
+                  <span v-if="!set.player2.placeholder" class="slot-score">{{ slotScore(set.player2) }}</span>
+                </div>
+                <div
+                  v-if="setTimer(set)"
+                  class="match-timer"
+                  :class="{ running: setTimer(set).running }"
+                  :title="setTimer(set).running ? 'Set in progress' : 'Set started, timer paused'"
+                >
+                  {{ setTimer(set).running ? "▶" : "⏸" }} {{ setTimer(set).display }}
                 </div>
               </article>
             </div>
@@ -367,12 +439,22 @@ watch(
                 won: cell.kind === 'set' && cell.rowWon,
                 lost: cell.kind === 'set' && cell.rowLost,
                 locked: cell.kind === 'set' && activeBucketLocked,
+                drafted: cell.kind === 'set' && hasDraft(cell.set),
+                'in-progress': cell.kind === 'set' && setTimer(cell.set)?.running,
               }"
               @click="cell.kind === 'set' && onSetClick(cell.set, 'quick-report')"
               @contextmenu.prevent="cell.kind === 'set' && onSetClick(cell.set, 'set-on-stream')"
             >
               <span v-if="cell.kind === 'set'" class="pool-score">
-                {{ cell.rowScore }} - {{ cell.colScore }}
+                {{ cell.rowScore === -1 ? "DQ" : cell.rowScore }} -
+                {{ cell.colScore === -1 ? "DQ" : cell.colScore }}
+              </span>
+              <span
+                v-if="cell.kind === 'set' && setTimer(cell.set)"
+                class="pool-timer"
+                :class="{ running: setTimer(cell.set).running }"
+              >
+                {{ setTimer(cell.set).running ? "▶" : "⏸" }} {{ setTimer(cell.set).display }}
               </span>
             </td>
             <td class="record-cell">
@@ -443,6 +525,66 @@ watch(
   background: rgba(161, 30, 30, 0.12);
 }
 
+.notice-draft {
+  color: #8a5a00;
+  background: rgba(216, 163, 0, 0.15);
+}
+
+.match-card.drafted {
+  border-color: #d8a300;
+}
+
+.draft-badge {
+  color: #d8a300;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.pool-cell.drafted {
+  outline: 1px solid #d8a300;
+  outline-offset: -1px;
+}
+
+.match-timer {
+  padding: 2px 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--panel-border);
+  opacity: 0.75;
+}
+
+.match-timer.running {
+  color: #1a6b3c;
+  background: rgba(35, 143, 79, 0.12);
+  opacity: 1;
+}
+
+.match-card.in-progress {
+  border-color: #1a6b3c;
+}
+
+.pool-timer {
+  display: block;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+.pool-timer.running {
+  color: #1a6b3c;
+  opacity: 1;
+}
+
+.pool-cell.in-progress {
+  outline: 1px solid #1a6b3c;
+  outline-offset: -1px;
+}
+
+.summary-live {
+  color: #1a6b3c;
+  font-weight: 600;
+}
+
 @media (prefers-color-scheme: dark) {
   .notice-info {
     color: #6fd99a;
@@ -452,6 +594,14 @@ watch(
   }
   .notice-locked {
     color: #ff8a8a;
+  }
+  .notice-draft {
+    color: #ffcc66;
+  }
+  .match-timer.running,
+  .pool-timer.running,
+  .summary-live {
+    color: #6fd99a;
   }
 }
 

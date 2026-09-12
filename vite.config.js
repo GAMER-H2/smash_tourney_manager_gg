@@ -11,6 +11,14 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+
+  // Component tests mount real Vue components, so they need a DOM; the pure
+  // lib tests don't care either way.
+  test: {
+    environment: "jsdom",
+    include: ["tests/**/*.test.js"],
+  },
+
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

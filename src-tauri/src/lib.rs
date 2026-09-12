@@ -4,10 +4,29 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    sync::Mutex,
+    thread,
+    time::{Duration, Instant},
+};
+use tauri::{path::BaseDirectory, AppHandle, Manager};
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
 };
 
 const START_GG_GQL_URL: &str = "https://api.start.gg/gql/alpha";
+const DEFAULT_PREVIEW_SOURCE_MODE: &str = "camera";
+const DEFAULT_PREVIEW_WHEP_URL: &str = "http://127.0.0.1:8889/preview/whep";
+
+fn default_preview_source_mode() -> String {
+    DEFAULT_PREVIEW_SOURCE_MODE.to_string()
+}
+
+fn default_preview_whep_url() -> String {
+    DEFAULT_PREVIEW_WHEP_URL.to_string()
+}
 
 // Bundled at compile time so the character icons this app already ships in
 // its own UI (public/character-icons) can also be staged next to
@@ -26,6 +45,10 @@ struct AppConfig {
     preferred_camera_id: Option<String>,
     per_page: u32,
     auto_write_overlay: bool,
+    #[serde(default = "default_preview_source_mode")]
+    preview_source_mode: String,
+    #[serde(default = "default_preview_whep_url")]
+    preview_whep_url: String,
 }
 
 impl Default for AppConfig {
@@ -37,6 +60,8 @@ impl Default for AppConfig {
             preferred_camera_id: None,
             per_page: 128,
             auto_write_overlay: true,
+            preview_source_mode: default_preview_source_mode(),
+            preview_whep_url: default_preview_whep_url(),
         }
     }
 }
@@ -54,8 +79,44 @@ struct FetchTournamentRequest {
 struct ReportSetRequest {
     api_token: String,
     set_id: String,
-    winner_id: u64,
+    // Optional purely so a double-DQ (nobody advances) can be reported -
+    // every other report, DQ or not, still has a winner.
+    winner_id: Option<u64>,
     game_data: Option<Vec<GameDataInput>>,
+    // Reports the set as a disqualification rather than a played result:
+    // start.gg records the loser's score as -1, which is what its own UI
+    // shows as "DQ".
+    is_dq: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkSetInProgressRequest {
+    api_token: String,
+    set_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkSetInProgressResult {
+    success: bool,
+    message: String,
+    // start.gg's own start timestamp (epoch seconds) for this set, when it
+    // tells us one - the app anchors its set timer to this rather than to the
+    // local clock, so both agree even if the mutation round-trip was slow.
+    started_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetSetRequest {
+    api_token: String,
+    set_id: String,
+    // Sets downstream of this one inherit its winner, so a correction that
+    // changes who advanced has to undo those too. Off by default: resetting
+    // a set whose winner already played on would otherwise silently wipe
+    // results that were reported correctly.
+    reset_dependent_sets: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +180,22 @@ struct WriteOverlayRequest {
     best_of: u32,
     player1: OverlayPlayer,
     player2: OverlayPlayer,
+    // Absent when no set timer has been started, so overlays can tell
+    // "no timer for this set" apart from "timer sitting at 0:00".
+    #[serde(default)]
+    timer: Option<OverlayTimer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayTimer {
+    // Pre-formatted by the frontend (which owns the clock) so every surface -
+    // this app's editor, the bracket view, and the overlay - shows the exact
+    // same string rather than each rounding the same millisecond count
+    // differently.
+    display: String,
+    running: bool,
+    elapsed_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +240,12 @@ struct TournamentSet {
     phase_group_id: Option<u64>,
     phase_group_identifier: Option<String>,
     state: i32,
+    // start.gg's own set clock: epoch seconds for when the set was marked in
+    // progress and when its result landed. A set that's in progress on
+    // start.gg carries startedAt, which the app's set timer anchors to so
+    // both clocks agree (and so the timer survives a refresh or a restart).
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
     winner_id: Option<u64>,
     best_of: u32,
     // The most-picked character per player across this set's reported games
@@ -213,6 +296,232 @@ fn config_file_path() -> Result<PathBuf, String> {
     fs::create_dir_all(&base).map_err(|e| format!("Failed to create config directory: {e}"))?;
     base.push("config.json");
     Ok(base)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaMtxStatus {
+    running: bool,
+    state: String,
+    pid: Option<u32>,
+    detail: String,
+    last_error: Option<String>,
+}
+
+impl Default for MediaMtxStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            state: "stopped".to_string(),
+            pid: None,
+            detail: "MediaMTX has not been started yet.".to_string(),
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MediaMtxLifecycle {
+    generation: u64,
+    child: Option<CommandChild>,
+    status: MediaMtxStatus,
+}
+
+#[derive(Default)]
+struct MediaMtxState(Mutex<MediaMtxLifecycle>);
+
+fn mediamtx_failure(error: impl std::fmt::Display) -> String {
+    format!(
+        "MediaMTX could not start: {error}. Ensure the target-specific 'mediamtx' sidecar is present in src-tauri/binaries and that mediamtx.yml is bundled."
+    )
+}
+
+fn wait_for_mediamtx_listener(open: bool, timeout: Duration) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], 8889));
+    let deadline = Instant::now() + timeout;
+    loop {
+        let is_open = TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok();
+        if is_open == open {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn start_mediamtx(app: &AppHandle) -> Result<MediaMtxStatus, String> {
+    let config_path = app
+        .path()
+        .resolve("mediamtx.yml", BaseDirectory::Resource)
+        .map_err(mediamtx_failure)?;
+
+    if !config_path.is_file() {
+        return Err(mediamtx_failure(format!(
+            "configuration resource '{}' was not found",
+            config_path.display()
+        )));
+    }
+
+    if wait_for_mediamtx_listener(true, Duration::from_millis(1)) {
+        return Err(mediamtx_failure(
+            "WHEP port 8889 is already in use; close the other relay or application instance",
+        ));
+    }
+
+    let command = app
+        .shell()
+        .sidecar("mediamtx")
+        .map_err(mediamtx_failure)?
+        .args([config_path.to_string_lossy().into_owned()]);
+    let (mut events, child) = command.spawn().map_err(mediamtx_failure)?;
+    let pid = child.pid();
+
+    if !wait_for_mediamtx_listener(true, Duration::from_secs(3)) {
+        let _ = child.kill();
+        return Err(mediamtx_failure(
+            "the WHEP listener at 127.0.0.1:8889 did not become ready within 3 seconds",
+        ));
+    }
+
+    let generation = {
+        let state = app.state::<MediaMtxState>();
+        let mut lifecycle = state
+            .0
+            .lock()
+            .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        let generation = lifecycle.generation;
+        lifecycle.child = Some(child);
+        lifecycle.status = MediaMtxStatus {
+            running: true,
+            state: "running".to_string(),
+            pid: Some(pid),
+            detail: format!(
+                "MediaMTX is running (PID {pid}); SRT ingest and WHEP playback are available on loopback."
+            ),
+            last_error: None,
+        };
+        generation
+    };
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let state = handle.state::<MediaMtxState>();
+            let Ok(mut lifecycle) = state.0.lock() else {
+                break;
+            };
+            if lifecycle.generation != generation {
+                break;
+            }
+
+            match event {
+                CommandEvent::Error(error) => {
+                    let error = format!("MediaMTX process communication failed: {error}");
+                    lifecycle.status.state = "error".to_string();
+                    lifecycle.status.detail = error.clone();
+                    lifecycle.status.last_error = Some(error);
+                }
+                CommandEvent::Terminated(payload) => {
+                    lifecycle.child = None;
+                    lifecycle.status.running = false;
+                    lifecycle.status.pid = None;
+                    let detail = format!(
+                        "MediaMTX exited unexpectedly (code {:?}, signal {:?}). Use restartMediaMtx() to retry.",
+                        payload.code, payload.signal
+                    );
+                    lifecycle.status.state = "error".to_string();
+                    lifecycle.status.detail = detail.clone();
+                    lifecycle.status.last_error = Some(detail);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    get_mediamtx_status(app.state())
+}
+
+fn record_mediamtx_start_failure(app: &AppHandle, error: String) {
+    let state = app.state::<MediaMtxState>();
+    if let Ok(mut lifecycle) = state.0.lock() {
+        lifecycle.child = None;
+        lifecycle.status = MediaMtxStatus {
+            running: false,
+            state: "error".to_string(),
+            pid: None,
+            detail: error.clone(),
+            last_error: Some(error),
+        };
+    };
+}
+
+fn stop_mediamtx(state: tauri::State<'_, MediaMtxState>) -> Result<(), String> {
+    let child = {
+        let mut lifecycle = state
+            .0
+            .lock()
+            .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        lifecycle.status.running = false;
+        lifecycle.status.state = "stopping".to_string();
+        lifecycle.status.detail = "Stopping MediaMTX…".to_string();
+        lifecycle.child.take()
+    };
+
+    if let Some(child) = child {
+        child
+            .kill()
+            .map_err(|e| format!("Failed to stop MediaMTX process: {e}"))?;
+        if !wait_for_mediamtx_listener(false, Duration::from_secs(3)) {
+            return Err(
+                "MediaMTX was stopped, but its WHEP port 8889 did not become available within 3 seconds. Another process may be using the port."
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut lifecycle = state
+        .0
+        .lock()
+        .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
+    lifecycle.status = MediaMtxStatus {
+        detail: "MediaMTX is stopped.".to_string(),
+        ..MediaMtxStatus::default()
+    };
+    Ok(())
+}
+
+#[tauri::command]
+fn get_mediamtx_status(state: tauri::State<'_, MediaMtxState>) -> Result<MediaMtxStatus, String> {
+    state
+        .0
+        .lock()
+        .map(|lifecycle| lifecycle.status.clone())
+        .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())
+}
+
+#[tauri::command]
+fn restart_mediamtx(app: AppHandle) -> Result<MediaMtxStatus, String> {
+    stop_mediamtx(app.state())?;
+    match start_mediamtx(&app) {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            record_mediamtx_start_failure(&app, error.clone());
+            Err(error)
+        }
+    }
+}
+
+// start.gg sends timestamps as epoch-second integers, but has been seen to
+// send other numeric ids as strings - parse both, consistently with parse_u64.
+fn parse_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
 fn parse_u64(value: &Value) -> Option<u64> {
@@ -876,6 +1185,8 @@ fn parse_set_nodes(
             .collect();
 
         let state = parse_i32(node.get("state").unwrap_or(&Value::Null)).unwrap_or(0);
+        let started_at = parse_i64(node.get("startedAt").unwrap_or(&Value::Null));
+        let completed_at = parse_i64(node.get("completedAt").unwrap_or(&Value::Null));
         let winner_id = parse_u64(node.get("winnerId").unwrap_or(&Value::Null));
         let round = parse_i32(node.get("round").unwrap_or(&Value::Null)).unwrap_or(0);
 
@@ -884,7 +1195,10 @@ fn parse_set_nodes(
         // always guessing 3: round-robin pools are conventionally best of
         // 3, elimination bracket sets best of 5.
         let max_score = player1.score.max(player2.score);
-        let phase_name_lower = phase_name.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let phase_name_lower = phase_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let looks_like_pool_set =
             round == 0 || phase_name_lower.contains("pool") || phase_name_lower.contains("group");
         let best_of = if max_score >= 3 {
@@ -905,6 +1219,8 @@ fn parse_set_nodes(
             phase_group_id,
             phase_group_identifier,
             state,
+            started_at,
+            completed_at,
             winner_id,
             best_of,
             player1_character,
@@ -1230,6 +1546,8 @@ async fn fetch_tournament_payload(
                   identifier
                   fullRoundText
                   state
+                  startedAt
+                  completedAt
                   winnerId
                   round
                   phaseGroup {
@@ -1303,6 +1621,8 @@ async fn fetch_tournament_payload(
                   identifier
                   fullRoundText
                   state
+                  startedAt
+                  completedAt
                   winnerId
                   round
                   phaseGroup {
@@ -1367,6 +1687,8 @@ async fn fetch_tournament_payload(
                   identifier
                   fullRoundText
                   state
+                  startedAt
+                  completedAt
                   winnerId
                   round
                   slots {
@@ -1448,6 +1770,8 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 identifier
                 fullRoundText
                 state
+                startedAt
+                completedAt
                 winnerId
                 round
                 phaseGroup {
@@ -1521,6 +1845,8 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 identifier
                 fullRoundText
                 state
+                startedAt
+                completedAt
                 winnerId
                 round
                 phaseGroup {
@@ -1585,6 +1911,8 @@ async fn fetch_event_payload(api_token: &str, slug: &str, per_page: u32) -> Resu
                 identifier
                 fullRoundText
                 state
+                startedAt
+                completedAt
                 winnerId
                 round
                 slots {
@@ -1687,6 +2015,8 @@ async fn fetch_event_phase_group_sets(
                   identifier
                   fullRoundText
                   state
+                  startedAt
+                  completedAt
                   winnerId
                   round
                   phaseGroup {
@@ -1774,6 +2104,45 @@ fn save_app_config(config: AppConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
 
     fs::write(&path, json).map_err(|e| format!("Failed writing config '{}': {e}", path.display()))
+}
+
+fn local_results_file_path() -> Result<PathBuf, String> {
+    let mut path = config_file_path()?;
+    path.pop();
+    path.push("local_results.json");
+    Ok(path)
+}
+
+// Results typed into a set editor but not yet sent to start.gg (e.g. the
+// quick-report modal was dismissed mid-set, or the set was pulled off
+// stream before it finished). Persisted verbatim as the frontend's own
+// editor-set shape, keyed by set id, so a crash or restart mid-bracket
+// doesn't lose what was already scored.
+#[tauri::command]
+fn load_local_results() -> Result<Value, String> {
+    let path = local_results_file_path()?;
+
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed reading local results '{}': {e}", path.display()))?;
+
+    // A corrupted store would otherwise block every save for the rest of the
+    // tournament - drafts are a convenience, so start over rather than fail.
+    Ok(serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})))
+}
+
+#[tauri::command]
+fn save_local_results(results: Value) -> Result<(), String> {
+    let path = local_results_file_path()?;
+
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| format!("Failed to serialize local results: {e}"))?;
+
+    fs::write(&path, json)
+        .map_err(|e| format!("Failed writing local results '{}': {e}", path.display()))
 }
 
 #[tauri::command]
@@ -2045,26 +2414,75 @@ async fn fetch_entrant_avatars(request: FetchAvatarsRequest) -> Result<EntrantAv
     })
 }
 
-#[tauri::command]
-async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult, String> {
-    if request.api_token.trim().is_empty() {
-        return Err("Missing start.gg API token".to_string());
+// Every mutation shape this app is willing to try for one report, in
+// priority order - start.gg's schema has varied over time in whether
+// reportBracketSet returns a selection set, and whether it accepts gameData
+// or isDQ at all, so a report is only considered failed once all of them
+// have been rejected. Split out from report_set_result (which does the
+// network calls) so the shapes themselves can be unit-tested.
+fn report_set_attempts(request: &ReportSetRequest) -> Vec<(String, Value)> {
+    let is_dq = request.is_dq.unwrap_or(false);
+
+    let mut base_variables = json!({ "setId": request.set_id.to_string() });
+    if let Some(winner_id) = request.winner_id {
+        base_variables["winnerId"] = json!(winner_id.to_string());
     }
 
-    if request.set_id.trim().is_empty() {
-        return Err("Invalid set ID".to_string());
+    let mut attempts: Vec<(String, Value)> = Vec::new();
+
+    if is_dq {
+        // A DQ has no games to report - start.gg derives the -1 score itself
+        // - so gameData is deliberately never sent alongside it.
+        if request.winner_id.is_some() {
+            attempts.push((
+                r#"
+                    mutation ReportDQ($setId: ID!, $winnerId: ID!) {
+                      reportBracketSet(setId: $setId, winnerId: $winnerId, isDQ: true) {
+                        id
+                        winnerId
+                        state
+                      }
+                    }
+                "#
+                .to_string(),
+                base_variables.clone(),
+            ));
+            attempts.push((
+                r#"
+                    mutation ReportDQ($setId: ID!, $winnerId: ID!) {
+                      reportBracketSet(setId: $setId, winnerId: $winnerId, isDQ: true)
+                    }
+                "#
+                .to_string(),
+                base_variables.clone(),
+            ));
+        } else {
+            // Double DQ: nobody advances, so there's no winnerId to send.
+            attempts.push((
+                r#"
+                    mutation ReportDoubleDQ($setId: ID!) {
+                      reportBracketSet(setId: $setId, isDQ: true) {
+                        id
+                        state
+                      }
+                    }
+                "#
+                .to_string(),
+                base_variables.clone(),
+            ));
+            attempts.push((
+                r#"
+                    mutation ReportDoubleDQ($setId: ID!) {
+                      reportBracketSet(setId: $setId, isDQ: true)
+                    }
+                "#
+                .to_string(),
+                base_variables.clone(),
+            ));
+        }
+
+        return attempts;
     }
-
-    if request.winner_id == 0 {
-        return Err("Invalid winner ID".to_string());
-    }
-
-    let base_variables = json!({
-        "setId": request.set_id.to_string(),
-        "winnerId": request.winner_id.to_string(),
-    });
-
-    let mut attempts: Vec<(&str, Value)> = Vec::new();
 
     // Per-game data (winner, character selections) is optional and comes
     // from a set editor's game rows, so only attempt it when there's
@@ -2105,7 +2523,8 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
                     state
                   }
                 }
-            "#,
+            "#
+            .to_string(),
             variables_with_game_data,
         ));
     }
@@ -2119,7 +2538,8 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
                 state
               }
             }
-        "#,
+        "#
+        .to_string(),
         base_variables.clone(),
     ));
     attempts.push((
@@ -2127,7 +2547,8 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
             mutation ReportSet($setId: ID!, $winnerId: ID!) {
               reportBracketSet(setId: $setId, winnerId: $winnerId)
             }
-        "#,
+        "#
+        .to_string(),
         base_variables.clone(),
     ));
     attempts.push((
@@ -2135,20 +2556,129 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
             mutation ReportSet($setId: ID!, $winnerId: ID!) {
               reportBracketSet(setId: $setId, winnerId: $winnerId, isDQ: false)
             }
-        "#,
+        "#
+        .to_string(),
         base_variables,
     ));
+
+    attempts
+}
+
+#[tauri::command]
+async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult, String> {
+    if request.api_token.trim().is_empty() {
+        return Err("Missing start.gg API token".to_string());
+    }
+
+    if request.set_id.trim().is_empty() {
+        return Err("Invalid set ID".to_string());
+    }
+
+    let is_dq = request.is_dq.unwrap_or(false);
+
+    match request.winner_id {
+        Some(0) => return Err("Invalid winner ID".to_string()),
+        // Only a DQ can legitimately have no winner at all (double DQ).
+        None if !is_dq => return Err("Invalid winner ID".to_string()),
+        _ => {}
+    }
+
+    let attempts = report_set_attempts(&request);
+    let mut failures = Vec::new();
+
+    for (mutation, variables) in attempts {
+        match startgg_graphql(&request.api_token, &mutation, variables).await {
+            Ok(_) => {
+                let outcome = match (is_dq, request.winner_id) {
+                    (true, Some(winner_id)) => {
+                        format!("reported as a DQ, winner {winner_id}")
+                    }
+                    (true, None) => "reported as a double DQ".to_string(),
+                    (false, Some(winner_id)) => format!("reported with winner {winner_id}"),
+                    (false, None) => "reported".to_string(),
+                };
+
+                return Ok(ReportSetResult {
+                    success: true,
+                    message: format!("Set {} {outcome}", request.set_id),
+                });
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+
+    Err(format!(
+        "Failed to report set after {} attempts: {}",
+        failures.len(),
+        failures.join(" | ")
+    ))
+}
+
+// Starts a set on start.gg, the same thing its own bracket UI does when a TO
+// clicks "start" on a match: the set moves to in-progress (state 2) and
+// start.gg begins timing it. Reporting the result is what stops that clock,
+// so there's no matching "stop" mutation - see report_set_result.
+#[tauri::command]
+async fn mark_set_in_progress(
+    request: MarkSetInProgressRequest,
+) -> Result<MarkSetInProgressResult, String> {
+    if request.api_token.trim().is_empty() {
+        return Err("Missing start.gg API token".to_string());
+    }
+
+    if request.set_id.trim().is_empty() {
+        return Err("Invalid set ID".to_string());
+    }
+
+    // Sets in a bracket start.gg hasn't actually started yet have synthetic
+    // "preview_..." ids that no mutation accepts; calling this for one is a
+    // caller bug, and a clear error beats start.gg's generic rejection.
+    if request.set_id.starts_with("preview") {
+        return Err(
+            "This set doesn't exist on start.gg yet - its pool/bracket hasn't been started."
+                .to_string(),
+        );
+    }
+
+    let variables = json!({ "setId": request.set_id.to_string() });
+
+    let attempts: Vec<(&str, Value)> = vec![
+        (
+            r#"
+                mutation MarkSetInProgress($setId: ID!) {
+                  markSetInProgress(setId: $setId) {
+                    id
+                    state
+                    startedAt
+                  }
+                }
+            "#,
+            variables.clone(),
+        ),
+        (
+            r#"
+                mutation MarkSetInProgress($setId: ID!) {
+                  markSetInProgress(setId: $setId) {
+                    id
+                    state
+                  }
+                }
+            "#,
+            variables,
+        ),
+    ];
 
     let mut failures = Vec::new();
 
     for (mutation, variables) in attempts {
         match startgg_graphql(&request.api_token, mutation, variables).await {
-            Ok(_) => {
-                return Ok(ReportSetResult {
+            Ok(data) => {
+                return Ok(MarkSetInProgressResult {
                     success: true,
-                    message: format!(
-                        "Set {} reported successfully with winner {}",
-                        request.set_id, request.winner_id
+                    message: format!("Set {} started on start.gg", request.set_id),
+                    started_at: parse_i64(
+                        data.pointer("/markSetInProgress/startedAt")
+                            .unwrap_or(&Value::Null),
                     ),
                 })
             }
@@ -2157,7 +2687,72 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
     }
 
     Err(format!(
-        "Failed to report set after {} attempts: {}",
+        "Failed to start set after {} attempts: {}",
+        failures.len(),
+        failures.join(" | ")
+    ))
+}
+
+// Undoes a reported result on start.gg so it can be reported again -
+// start.gg has no "edit a completed set" mutation, so correcting a mistake
+// means resetting the set and re-reporting it.
+#[tauri::command]
+async fn reset_set_result(request: ResetSetRequest) -> Result<ReportSetResult, String> {
+    if request.api_token.trim().is_empty() {
+        return Err("Missing start.gg API token".to_string());
+    }
+
+    if request.set_id.trim().is_empty() {
+        return Err("Invalid set ID".to_string());
+    }
+
+    let reset_dependent_sets = request.reset_dependent_sets.unwrap_or(false);
+    let variables = json!({
+        "setId": request.set_id.to_string(),
+        "resetDependentSets": reset_dependent_sets,
+    });
+
+    let attempts: Vec<(&str, Value)> = vec![
+        (
+            r#"
+                mutation ResetSet($setId: ID!, $resetDependentSets: Boolean) {
+                  resetSet(setId: $setId, resetDependentSets: $resetDependentSets) {
+                    id
+                    state
+                  }
+                }
+            "#,
+            variables.clone(),
+        ),
+        (
+            r#"
+                mutation ResetSet($setId: ID!) {
+                  resetSet(setId: $setId) {
+                    id
+                    state
+                  }
+                }
+            "#,
+            json!({ "setId": request.set_id.to_string() }),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+
+    for (mutation, variables) in attempts {
+        match startgg_graphql(&request.api_token, mutation, variables).await {
+            Ok(_) => {
+                return Ok(ReportSetResult {
+                    success: true,
+                    message: format!("Set {} reset on start.gg", request.set_id),
+                })
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+
+    Err(format!(
+        "Failed to reset set after {} attempts: {}",
         failures.len(),
         failures.join(" | ")
     ))
@@ -2239,7 +2834,7 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
 
     let out_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
 
-    let payload = json!({
+    let mut payload = json!({
         "timestamp": Utc::now().timestamp_millis() as f64 / 1000.0,
         "tournamentInfo": {
             "tournamentName": request.tournament_name,
@@ -2266,6 +2861,17 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
             }
         }
     });
+
+    // Extra top-level key rather than something nested inside `score`: TSH's
+    // own schema has no timer field, and layouts that don't know about this
+    // one simply ignore it.
+    if let Some(timer) = request.timer.as_ref() {
+        payload["timer"] = json!({
+            "display": timer.display,
+            "running": timer.running,
+            "elapsedSeconds": timer.elapsed_seconds,
+        });
+    }
 
     let serialized = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Failed to serialize overlay JSON: {e}"))?;
@@ -2346,8 +2952,10 @@ pub fn run() {
     ))]
     disable_gstreamer_pipewire_plugin();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .manage(MediaMtxState::default())
         .setup(|_app| {
             // WebKitGTK (Tauri's Linux webview) denies getUserMedia by default
             // unless the host app answers its "permission-request" signal itself;
@@ -2360,8 +2968,6 @@ pub fn run() {
                 target_os = "openbsd"
             ))]
             {
-                use tauri::Manager;
-
                 if let Some(main_webview) = _app.get_webview_window("main") {
                     main_webview.with_webview(|webview| {
                         use webkit2gtk::{
@@ -2382,6 +2988,10 @@ pub fn run() {
                 }
             }
 
+            if let Err(error) = start_mediamtx(_app.handle()) {
+                record_mediamtx_start_failure(_app.handle(), error);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2391,9 +3001,310 @@ pub fn run() {
             fetch_game_characters,
             fetch_entrant_avatars,
             report_set_result,
+            reset_set_result,
+            mark_set_in_progress,
+            load_local_results,
+            save_local_results,
             write_stream_overlay,
             get_platform,
+            get_mediamtx_status,
+            restart_mediamtx,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            let _ = stop_mediamtx(app_handle.state());
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report_request(winner_id: Option<u64>, is_dq: Option<bool>) -> ReportSetRequest {
+        ReportSetRequest {
+            api_token: "token".to_string(),
+            set_id: "101".to_string(),
+            winner_id,
+            game_data: None,
+            is_dq,
+        }
+    }
+
+    fn game_data() -> Vec<GameDataInput> {
+        vec![GameDataInput {
+            game_num: 1,
+            winner_id: Some(7),
+            selections: vec![GameSelectionInput {
+                entrant_id: 7,
+                character_id: 1234,
+            }],
+        }]
+    }
+
+    #[test]
+    fn played_set_tries_game_data_first_then_plain_winner_shapes() {
+        let mut request = report_request(Some(7), None);
+        request.game_data = Some(game_data());
+
+        let attempts = report_set_attempts(&request);
+
+        assert_eq!(attempts.len(), 4);
+        assert!(attempts[0].0.contains("$gameData"));
+        assert_eq!(attempts[0].1["gameData"][0]["gameNum"], json!(1));
+        assert_eq!(attempts[0].1["gameData"][0]["winnerId"], json!("7"));
+        assert_eq!(
+            attempts[0].1["gameData"][0]["selections"][0]["characterId"],
+            json!(1234)
+        );
+        // Ids go over the wire as strings (start.gg's ID scalar).
+        assert_eq!(attempts[0].1["setId"], json!("101"));
+        assert_eq!(attempts[0].1["winnerId"], json!("7"));
+        assert!(attempts[1..]
+            .iter()
+            .all(|(query, _)| !query.contains("gameData")));
+    }
+
+    #[test]
+    fn a_set_with_no_game_data_skips_the_game_data_shape() {
+        let attempts = report_set_attempts(&report_request(Some(7), None));
+
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts
+            .iter()
+            .all(|(query, _)| !query.contains("gameData")));
+    }
+
+    #[test]
+    fn dq_reports_the_opponent_as_winner_with_the_dq_flag() {
+        let attempts = report_set_attempts(&report_request(Some(7), Some(true)));
+
+        assert!(!attempts.is_empty());
+        for (query, variables) in &attempts {
+            assert!(query.contains("isDQ: true"));
+            assert!(!query.contains("gameData"));
+            assert_eq!(variables["winnerId"], json!("7"));
+        }
+    }
+
+    #[test]
+    fn a_dq_never_sends_game_data_even_if_games_were_scored() {
+        let mut request = report_request(Some(7), Some(true));
+        request.game_data = Some(game_data());
+
+        let attempts = report_set_attempts(&request);
+
+        assert!(attempts
+            .iter()
+            .all(|(query, variables)| !query.contains("gameData")
+                && variables.get("gameData").is_none()));
+    }
+
+    #[test]
+    fn double_dq_reports_without_a_winner() {
+        let attempts = report_set_attempts(&report_request(None, Some(true)));
+
+        assert!(!attempts.is_empty());
+        for (query, variables) in &attempts {
+            assert!(query.contains("isDQ: true"));
+            assert!(!query.contains("$winnerId"));
+            assert!(variables.get("winnerId").is_none());
+        }
+    }
+
+    #[test]
+    fn starting_a_set_that_only_exists_as_a_preview_is_rejected_locally() {
+        let request = MarkSetInProgressRequest {
+            api_token: "token".to_string(),
+            set_id: "preview_3393165_1_0".to_string(),
+        };
+
+        let error = tauri::async_runtime::block_on(mark_set_in_progress(request))
+            .expect_err("preview sets can't be started");
+        assert!(error.contains("hasn't been started"));
+    }
+
+    #[test]
+    fn starting_a_set_needs_a_token_and_a_set_id() {
+        let missing_token = MarkSetInProgressRequest {
+            api_token: "  ".to_string(),
+            set_id: "101".to_string(),
+        };
+        assert!(tauri::async_runtime::block_on(mark_set_in_progress(missing_token)).is_err());
+
+        let missing_set = MarkSetInProgressRequest {
+            api_token: "token".to_string(),
+            set_id: String::new(),
+        };
+        assert!(tauri::async_runtime::block_on(mark_set_in_progress(missing_set)).is_err());
+    }
+
+    #[test]
+    fn set_timestamps_parse_from_numbers_and_strings() {
+        assert_eq!(parse_i64(&json!(1_767_225_600)), Some(1_767_225_600));
+        assert_eq!(parse_i64(&json!("1767225600")), Some(1_767_225_600));
+        assert_eq!(parse_i64(&Value::Null), None);
+        assert_eq!(parse_i64(&json!("soon")), None);
+    }
+
+    #[test]
+    fn every_set_query_asks_for_the_set_clock() {
+        // startedAt is what the app's set timer anchors to, and there are
+        // several set queries here (event/phase-group/tournament variants,
+        // plus state-filtered fallbacks) - one that forgot to select it would
+        // silently restart that set's timer from zero instead.
+        let lines: Vec<&str> = include_str!("lib.rs").lines().map(str::trim).collect();
+        let selections: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == "fullRoundText")
+            .map(|(index, _)| index)
+            .collect();
+
+        assert!(!selections.is_empty(), "expected some set queries");
+        for index in selections {
+            assert_eq!(
+                &lines[index + 1..index + 4],
+                ["state", "startedAt", "completedAt"],
+                "set query at line {} is missing the set clock",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_carrying_settings_this_version_dropped_still_loads() {
+        // Earlier builds had a configurable set length, back when the timer
+        // counted down; a config file written by one of those must not stop
+        // this version starting.
+        let legacy = r#"{
+            "apiToken": "t",
+            "tournamentSlug": "tournament/x/event/y",
+            "streamOutputPath": "/tmp/state.json",
+            "preferredCameraId": null,
+            "perPage": 128,
+            "autoWriteOverlay": true,
+            "setTimerSeconds": 480
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(legacy).expect("legacy config should parse");
+        assert_eq!(config.per_page, 128);
+        assert!(config.auto_write_overlay);
+        assert_eq!(config.preview_source_mode, DEFAULT_PREVIEW_SOURCE_MODE);
+        assert_eq!(config.preview_whep_url, DEFAULT_PREVIEW_WHEP_URL);
+    }
+
+    #[test]
+    fn preview_settings_round_trip_when_present() {
+        let raw = r#"{
+            "apiToken": "t",
+            "tournamentSlug": "tournament/x/event/y",
+            "streamOutputPath": "/tmp/state.json",
+            "preferredCameraId": null,
+            "perPage": 64,
+            "autoWriteOverlay": false,
+            "previewSourceMode": "webrtc",
+            "previewWhepUrl": "http://127.0.0.1:7777/custom/whep"
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(raw).expect("current config should parse");
+        let serialized = serde_json::to_value(config).expect("config should serialize");
+        assert_eq!(serialized["previewSourceMode"], json!("webrtc"));
+        assert_eq!(
+            serialized["previewWhepUrl"],
+            json!("http://127.0.0.1:7777/custom/whep")
+        );
+    }
+
+    fn overlay_request(path: &Path, timer: Option<OverlayTimer>) -> WriteOverlayRequest {
+        WriteOverlayRequest {
+            output_path: path.to_string_lossy().to_string(),
+            tournament_name: "Test Tourney".to_string(),
+            round_text: "Winners Final".to_string(),
+            event_name: "Ultimate Singles".to_string(),
+            best_of: 3,
+            player1: OverlayPlayer {
+                name: "Alice".to_string(),
+                character: None,
+                character_icon: None,
+                score: 2,
+                avatar_url: None,
+            },
+            player2: OverlayPlayer {
+                name: "Bob".to_string(),
+                character: None,
+                character_icon: None,
+                score: 0,
+                avatar_url: None,
+            },
+            timer,
+        }
+    }
+
+    fn temp_overlay_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mtm-test-{name}-{}", std::process::id()));
+        path.push("program_state.json");
+        path
+    }
+
+    #[test]
+    fn overlay_keeps_the_tsh_score_shape() {
+        let path = temp_overlay_path("overlay-shape");
+        write_stream_overlay(overlay_request(&path, None)).expect("overlay should be written");
+
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("overlay file")).unwrap();
+
+        assert_eq!(
+            written["tournamentInfo"]["tournamentName"],
+            json!("Test Tourney")
+        );
+        assert_eq!(written["score"]["1"]["best_of"], json!(3));
+        assert_eq!(written["score"]["1"]["match"], json!("Winners Final"));
+        assert_eq!(
+            written["score"]["1"]["team"]["1"]["player"]["1"]["name"],
+            json!("Alice")
+        );
+        assert_eq!(written["score"]["1"]["team"]["1"]["score"], json!(2));
+        // Layouts dereference these unconditionally, so they must be objects.
+        assert!(written["score"]["1"]["team"]["2"]["player"]["1"]["country"].is_object());
+        // No timer was running, so the overlay carries no timer block.
+        assert!(written.get("timer").is_none());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_publishes_the_set_timer_when_there_is_one() {
+        let path = temp_overlay_path("overlay-timer");
+        write_stream_overlay(overlay_request(
+            &path,
+            Some(OverlayTimer {
+                display: "8:15".to_string(),
+                running: true,
+                elapsed_seconds: 495,
+            }),
+        ))
+        .expect("overlay should be written");
+
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("overlay file")).unwrap();
+
+        assert_eq!(written["timer"]["display"], json!("8:15"));
+        assert_eq!(written["timer"]["running"], json!(true));
+        assert_eq!(written["timer"]["elapsedSeconds"], json!(495));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_rejects_an_empty_output_path() {
+        let mut request = overlay_request(Path::new("/tmp/unused.json"), None);
+        request.output_path = "   ".to_string();
+        assert!(write_stream_overlay(request).is_err());
+    }
 }

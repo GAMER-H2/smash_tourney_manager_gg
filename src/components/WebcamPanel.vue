@@ -1,9 +1,19 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getPlatform } from "../lib/api";
+import { WhepClient } from "../lib/whep";
 
 const props = defineProps({
+  sourceMode: {
+    type: String,
+    default: "camera",
+    validator: (value) => ["camera", "webrtc"].includes(value),
+  },
   cameraId: {
+    type: String,
+    default: "",
+  },
+  whepUrl: {
     type: String,
     default: "",
   },
@@ -17,13 +27,42 @@ const stream = ref(null);
 const error = ref("");
 const loading = ref(false);
 const isLinux = ref(false);
+const whepState = ref("idle");
+
+const MAX_WHEP_RECONNECT_DELAY_MS = 10_000;
+let whepClient = null;
+let whepRequestId = 0;
+let whepReconnectAttempts = 0;
+let whepReconnectTimer = null;
+
+const whepStateLabel = computed(
+  () =>
+    ({
+      idle: "Idle",
+      connecting: "Connecting",
+      connected: "Connected",
+      reconnecting: "Reconnecting",
+      error: "Error",
+    })[whepState.value],
+);
+
+const whepStatus = computed(() => {
+  if (!props.whepUrl.trim()) return "Enter a WHEP URL to start preview.";
+  if (whepState.value === "connecting") return "Connecting to WebRTC preview…";
+  if (whepState.value === "reconnecting") {
+    return `Preview unavailable. Reconnecting (attempt ${whepReconnectAttempts})…`;
+  }
+  return "";
+});
 
 function stopStream() {
   if (!stream.value) return;
-  for (const track of stream.value.getTracks()) {
+  const current = stream.value;
+  for (const track of current.getTracks()) {
     track.stop();
   }
   stream.value = null;
+  if (videoEl.value?.srcObject === current) videoEl.value.srcObject = null;
 }
 
 async function requestPermissionIfNeeded() {
@@ -69,6 +108,77 @@ async function refreshCameras() {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function disposeWhep() {
+  clearTimeout(whepReconnectTimer);
+  whepReconnectTimer = null;
+  whepClient?.close();
+  whepClient = null;
+}
+
+function scheduleWhepReconnect(requestId) {
+  if (
+    requestId !== whepRequestId ||
+    props.sourceMode !== "webrtc" ||
+    whepReconnectTimer
+  ) {
+    return;
+  }
+
+  whepReconnectAttempts++;
+  whepState.value = "reconnecting";
+  const delay = Math.min(1000 * 2 ** Math.min(whepReconnectAttempts - 1, 4), MAX_WHEP_RECONNECT_DELAY_MS);
+  whepReconnectTimer = setTimeout(() => {
+    whepReconnectTimer = null;
+    connectWhep(false);
+  }, delay);
+}
+
+async function connectWhep(resetReconnects = true) {
+  const requestId = ++whepRequestId;
+  disposeWhep();
+  latestRequestId++;
+  stopStream();
+
+  if (resetReconnects) whepReconnectAttempts = 0;
+  error.value = "";
+
+  if (!props.whepUrl.trim()) {
+    whepState.value = "idle";
+    return;
+  }
+
+  whepState.value = whepReconnectAttempts > 0 ? "reconnecting" : "connecting";
+
+  try {
+    const client = new WhepClient({
+      endpoint: props.whepUrl,
+      videoElement: videoEl.value,
+      onStateChange(state) {
+        if (requestId !== whepRequestId || client !== whepClient) return;
+
+        if (state === "connected") {
+          clearTimeout(whepReconnectTimer);
+          whepReconnectTimer = null;
+          whepReconnectAttempts = 0;
+          whepState.value = "connected";
+          error.value = "";
+        } else if (state === "failed" || state === "disconnected" || state === "closed") {
+          error.value = "WebRTC preview connection was lost.";
+          scheduleWhepReconnect(requestId);
+        } else if (state === "connecting" && whepReconnectAttempts === 0) {
+          whepState.value = "connecting";
+        }
+      },
+    });
+    whepClient = client;
+    await client.connect();
+  } catch (err) {
+    if (requestId !== whepRequestId || err?.name === "AbortError") return;
+    error.value = `Failed to start WebRTC preview: ${err?.message || err}`;
+    scheduleWhepReconnect(requestId);
+  }
 }
 
 // The very first capture pipeline built right after app launch can silently
@@ -215,7 +325,27 @@ async function goFullscreen() {
 watch(
   () => props.cameraId,
   (deviceId) => {
-    startPreview(deviceId);
+    if (props.sourceMode === "camera") startPreview(deviceId);
+  },
+);
+
+watch(
+  () => [props.sourceMode, props.whepUrl],
+  async ([sourceMode], [previousSourceMode]) => {
+    error.value = "";
+
+    if (sourceMode === "webrtc") {
+      await connectWhep(true);
+      return;
+    }
+
+    if (previousSourceMode !== "webrtc") return;
+
+    ++whepRequestId;
+    disposeWhep();
+    whepState.value = "idle";
+    await refreshCameras();
+    if (props.cameraId) await startPreview(props.cameraId);
   },
 );
 
@@ -226,13 +356,20 @@ onMounted(async () => {
     isLinux.value = false;
   }
 
-  await refreshCameras();
-  if (props.cameraId) {
-    await startPreview(props.cameraId);
+  if (props.sourceMode === "webrtc") {
+    await connectWhep(true);
+  } else {
+    await refreshCameras();
+    if (props.cameraId) {
+      await startPreview(props.cameraId);
+    }
   }
 });
 
 onBeforeUnmount(() => {
+  ++latestRequestId;
+  ++whepRequestId;
+  disposeWhep();
   stopStream();
 });
 </script>
@@ -242,19 +379,25 @@ onBeforeUnmount(() => {
     <header class="panel-header">
       <h2>Video Source</h2>
       <div class="controls">
-        <select :value="cameraId" @change="emit('update:cameraId', $event.target.value)">
-          <option value="">Select a camera…</option>
-          <option v-for="camera in cameras" :key="camera.deviceId" :value="camera.deviceId">
-            {{ camera.label }}
-          </option>
-        </select>
+        <template v-if="sourceMode === 'camera'">
+          <select :value="cameraId" @change="emit('update:cameraId', $event.target.value)">
+            <option value="">Select a camera…</option>
+            <option v-for="camera in cameras" :key="camera.deviceId" :value="camera.deviceId">
+              {{ camera.label }}
+            </option>
+          </select>
 
-        <button type="button" @click="refreshCameras">Refresh</button>
+          <button type="button" @click="refreshCameras">Refresh</button>
+        </template>
+        <template v-else>
+          <span class="source-label">WebRTC · {{ whepStateLabel }}</span>
+          <button type="button" @click="connectWhep(true)">Retry</button>
+        </template>
         <button type="button" @click="goFullscreen">Fullscreen</button>
       </div>
     </header>
 
-    <p v-if="isLinux" class="linux-note">
+    <p v-if="sourceMode === 'camera' && isLinux" class="linux-note">
       On Linux, OBS Virtual Camera preview doesn't work due to a WebKitGTK bug (filed upstream).
       Physical cameras work normally.
     </p>
@@ -262,9 +405,17 @@ onBeforeUnmount(() => {
     <div class="preview-wrapper">
       <video ref="videoEl" muted playsinline autoplay class="preview cover" />
 
-      <p v-if="loading" class="status">Loading cameras…</p>
-      <p v-else-if="error" class="status error">{{ error }}</p>
-      <p v-else-if="!cameraId" class="status">Select a camera to start preview.</p>
+      <template v-if="sourceMode === 'camera'">
+        <p v-if="loading" class="status">Loading cameras…</p>
+        <p v-else-if="error" class="status error">{{ error }}</p>
+        <p v-else-if="!cameraId" class="status">Select a camera to start preview.</p>
+      </template>
+      <template v-else>
+        <p v-if="error && whepState === 'error'" class="status error">{{ error }}</p>
+        <p v-else-if="whepStatus" class="status" :class="{ error: error }">
+          {{ whepStatus }}
+        </p>
+      </template>
     </div>
   </section>
 </template>
@@ -309,8 +460,13 @@ onBeforeUnmount(() => {
 }
 
 .controls select,
-.controls button {
+.controls button,
+.source-label {
   font-size: 12px;
+}
+
+.source-label {
+  color: var(--text-muted, #aaa);
 }
 
 .preview-wrapper {

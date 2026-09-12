@@ -1,0 +1,33 @@
+# Private, application-managed preview relay. All listeners are loopback-only.
+logLevel: info
+logDestinations: [stdout]
+
+api: no
+metrics: no
+pprof: no
+playback: no
+
+rtsp: no
+rtmp: no
+hls: no
+moq: no
+
+# OBS/encoders publish MPEG-TS to:
+# srt://127.0.0.1:8890?streamid=publish:preview
+srt: yes
+srtAddress: 127.0.0.1:8890
+
+# The app/webview reads the preview over WHEP at:
+# http://127.0.0.1:8889/preview/whep
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcLocalTCPAddress: ''
+webrtcAdditionalHosts: [127.0.0.1]
+
+pathDefaults:
+  source: publisher
+  sourceOnDemand: no
+
+paths:
+  preview: {}

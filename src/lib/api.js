@@ -16,6 +16,22 @@ export async function reportSetResult(request) {
   return invoke("report_set_result", { request });
 }
 
+export async function markSetInProgress(request) {
+  return invoke("mark_set_in_progress", { request });
+}
+
+export async function resetSetResult(request) {
+  return invoke("reset_set_result", { request });
+}
+
+export async function loadLocalResults() {
+  return invoke("load_local_results");
+}
+
+export async function saveLocalResults(results) {
+  return invoke("save_local_results", { results });
+}
+
 export async function fetchGameCharacters(request) {
   return invoke("fetch_game_characters", { request });
 }
@@ -30,4 +46,12 @@ export async function writeStreamOverlay(request) {
 
 export async function getPlatform() {
   return invoke("get_platform");
+}
+
+export async function getMediaMtxStatus() {
+  return invoke("get_mediamtx_status");
+}
+
+export async function restartMediaMtx() {
+  return invoke("restart_mediamtx");
 }

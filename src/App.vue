@@ -8,9 +8,15 @@ import {
   fetchEntrantAvatars,
   fetchGameCharacters,
   fetchTournamentState,
+  getMediaMtxStatus,
   loadConfig,
+  loadLocalResults,
+  markSetInProgress,
   reportSetResult,
+  resetSetResult,
+  restartMediaMtx,
   saveConfig,
+  saveLocalResults,
   writeStreamOverlay,
 } from "./lib/api";
 import {
@@ -21,20 +27,46 @@ import {
 } from "./lib/characters";
 import {
   canReportGame,
+  clearResults,
   cloneEditorSet,
   createEditorSetFromTournamentSet,
   currentGameCharacter,
   emptyEditorSet,
   emptyGame,
+  hasResult,
+  isSubmittable,
+  scoreFor,
+  toggleDq,
   winnerEntrantId,
-  winsFor,
 } from "./lib/set-utils";
+import {
+  draftSetIds,
+  emptyDraftStore,
+  getDraft,
+  normalizeDraftStore,
+  putDraft,
+  removeDraft,
+} from "./lib/drafts";
+import {
+  createTimerState,
+  elapsedMs,
+  frozenTimer,
+  isRunning,
+  pauseTimer,
+  resetTimer,
+  startTimer,
+  timerDisplay,
+  timerFromServerStart,
+  timerOverlayPayload,
+} from "./lib/timer";
 
 const config = reactive({
   apiToken: "",
   tournamentSlug: "",
   streamOutputPath: "",
   preferredCameraId: "",
+  previewSourceMode: "camera",
+  previewWhepUrl: "http://127.0.0.1:8889/preview/whep",
   perPage: 128,
   autoWriteOverlay: true,
 });
@@ -51,8 +83,12 @@ const quickReportOpen = ref(false);
 const loadingTournament = ref(false);
 const submittingStream = ref(false);
 const submittingQuickReport = ref(false);
+const resettingStream = ref(false);
+const resettingQuickReport = ref(false);
 const writingOverlay = ref(false);
 const savingConfig = ref(false);
+const restartingMediaMtx = ref(false);
+const mediaMtxStatus = ref(null);
 
 const statusMessage = ref("");
 const errorMessage = ref("");
@@ -86,8 +122,25 @@ const streamAvatars = ref({ player1Avatar: null, player2Avatar: null });
 //             is blocked until a manual refresh brings it back.
 const bucketSync = reactive(new Map());
 
+// Results scored in an editor but never submitted to start.gg, persisted to
+// disk by set id (see lib/drafts.js). Held here so the bracket view can flag
+// which sets are carrying one, and so reopening such a set restores it.
+const draftStore = ref(emptyDraftStore());
+
+// Set timers, keyed by start.gg set id so a timer keeps running while its
+// set moves between the stream editor, the quick-report modal and the
+// bracket - plus one fixed key for the blank/manual stream set, which has no
+// set id of its own. Only the derived `timerNow` ticks; the timers
+// themselves are wall-clock anchored (see lib/timer.js).
+const STREAM_TIMER_KEY = "__stream__";
+const timers = reactive(new Map());
+const timerNow = ref(Date.now());
+
 let overlayTimer = null;
 let bucketSyncRetryTimer = null;
+let timerTickHandle = null;
+let lastOverlayTimerSecond = null;
+let mediaMtxStatusTimer = null;
 
 function setSuccess(message) {
   errorMessage.value = "";
@@ -128,9 +181,13 @@ function applyOptimisticResult(bucket, setId, editorSet, winnerEntrantId) {
   const loserSlot = target.player1?.entrantId === winnerEntrantId ? target.player2 : target.player1;
 
   target.state = 3;
-  target.winnerId = winnerEntrantId;
-  if (target.player1) target.player1.score = winsFor(editorSet, 1);
-  if (target.player2) target.player2.score = winsFor(editorSet, 2);
+  target.winnerId = winnerEntrantId ?? null;
+  if (target.player1) target.player1.score = scoreFor(editorSet, 1);
+  if (target.player2) target.player2.score = scoreFor(editorSet, 2);
+
+  // A double DQ completes the set without advancing anyone, so there's
+  // nothing to route into the sets downstream of it.
+  if (!winnerEntrantId) return;
 
   for (const nextSet of bucket.sets) {
     for (const slot of [nextSet.player1, nextSet.player2]) {
@@ -161,6 +218,7 @@ async function drainBucketSyncQueue(state, freshBucket) {
         setId: target.id,
         winnerId: item.winnerEntrantId,
         gameData: item.gameData,
+        isDq: Boolean(item.isDq),
       });
     } catch (err) {
       console.error("Failed to replay a queued report", err);
@@ -333,6 +391,354 @@ function swapPlayers(targetRef) {
   });
 }
 
+// --- Set timers ---------------------------------------------------------
+
+function timerKey(editorSet) {
+  return editorSet?.setId ? String(editorSet.setId) : STREAM_TIMER_KEY;
+}
+
+function ensureTimer(key) {
+  if (!timers.has(key)) {
+    timers.set(key, createTimerState());
+  }
+  return timers.get(key);
+}
+
+// The clock as the editors render it. Reads timerNow (not Date.now()) so
+// Vue re-renders it on every tick rather than only when something else in
+// the set changes.
+function timerViewFor(editorSet) {
+  if (!editorSet) return null;
+  const state = timers.get(timerKey(editorSet)) ?? createTimerState();
+
+  return {
+    display: timerDisplay(state, timerNow.value),
+    running: isRunning(state),
+    // start.gg has this set in progress: its own clock is running too, and
+    // only reporting the result stops it.
+    startedOnStartgg: Boolean(state.startedOnStartgg),
+    // The set is reported, so this is how long it took, not a live clock.
+    final: Boolean(editorSet.completed),
+  };
+}
+
+const setStateById = computed(() => {
+  const out = new Map();
+  for (const bucket of tournamentData.value?.buckets ?? []) {
+    for (const set of bucket.sets ?? []) {
+      out.set(String(set.id), Number(set.state));
+    }
+  }
+  return out;
+});
+
+// Live clocks for the bracket/pool view, so a set that's under way is
+// visible as such without having to open it - the same thing start.gg's own
+// bracket does. Sets that have been reported are left out: their card shows
+// the score, which is the more useful thing once a set is over.
+const liveSetTimers = computed(() => {
+  const now = timerNow.value;
+  const out = new Map();
+
+  for (const [key, state] of timers.entries()) {
+    if (key === STREAM_TIMER_KEY) continue;
+    if (setStateById.value.get(key) === 3) continue;
+
+    const running = isRunning(state);
+    if (!running && elapsedMs(state, now) === 0) continue;
+
+    out.set(key, { display: timerDisplay(state, now), running });
+  }
+
+  return out;
+});
+
+const streamTimer = computed(() => timerViewFor(streamSet.value));
+const quickReportTimer = computed(() => timerViewFor(quickReportSet.value));
+
+// One interval for every timer, running only while at least one of them is,
+// so an idle app isn't waking up four times a second forever.
+function startTimerTick() {
+  if (timerTickHandle) return;
+  timerTickHandle = setInterval(() => {
+    timerNow.value = Date.now();
+    if (![...timers.values()].some(isRunning)) {
+      stopTimerTick();
+      return;
+    }
+    writeOverlayOnTimerSecond();
+  }, 250);
+}
+
+function stopTimerTick() {
+  if (!timerTickHandle) return;
+  clearInterval(timerTickHandle);
+  timerTickHandle = null;
+}
+
+// Keeps the overlay's clock moving while the stream set's timer runs, but
+// only once per whole second - the UI ticks four times as often, and there's
+// no point rewriting the overlay file for a change no viewer can see.
+function writeOverlayOnTimerSecond() {
+  if (!config.autoWriteOverlay || !streamSet.value) return;
+
+  const state = timers.get(timerKey(streamSet.value));
+  if (!isRunning(state)) return;
+
+  const second = Math.floor(elapsedMs(state, timerNow.value) / 1000);
+  if (second === lastOverlayTimerSecond) return;
+
+  lastOverlayTimerSecond = second;
+  writeOverlayFromStreamSet(true);
+}
+
+// Whether this set can be started/un-started on start.gg at all. A blank
+// stream set has nothing to start; a set in a bracket start.gg hasn't
+// actually started yet only has a synthetic "preview_..." id that no
+// mutation accepts; and a bucket that's mid-desync is about to have its set
+// ids replaced, so anything sent against them now would hit the wrong set.
+function startggSetClockBlocker(editorSet) {
+  if (!editorSet?.setId) return "local";
+  if (!config.apiToken.trim()) return "no-token";
+  if (String(editorSet.setId).startsWith("preview")) return "preview";
+
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, editorSet.setId);
+  if (bucketId && bucketSync.get(bucketId)) return "desynced";
+
+  return null;
+}
+
+// Starting the timer is how a set gets started on start.gg, mirroring its
+// own bracket UI: the set moves to in-progress there and start.gg begins
+// timing it, and reporting the result is what stops that clock again.
+// Pausing and resuming here are deliberately local-only - start.gg has no
+// concept of a paused set, so the alternative would be repeatedly
+// starting/resetting the set out from under anyone watching the bracket.
+async function onToggleTimer(editorSet) {
+  const key = timerKey(editorSet);
+  const previous = ensureTimer(key);
+  const wasRunning = isRunning(previous);
+
+  timers.set(key, wasRunning ? pauseTimer(previous, Date.now()) : startTimer(previous, Date.now()));
+  timerNow.value = Date.now();
+  if (!wasRunning) startTimerTick();
+  scheduleOverlayWrite();
+
+  if (wasRunning || previous.startedOnStartgg) return;
+  await startSetOnStartgg(editorSet, key);
+}
+
+async function startSetOnStartgg(editorSet, key) {
+  // A set already reported has been timed and closed out on start.gg
+  // already; starting it again would need a reset first.
+  if (editorSet?.completed) return;
+
+  switch (startggSetClockBlocker(editorSet)) {
+    case null:
+      break;
+    case "preview":
+      setSuccess(
+        "Timer started here only - this set's pool/bracket hasn't been started on start.gg yet.",
+      );
+      return;
+    case "desynced":
+      setSuccess(
+        "Timer started here only - this pool/bracket is still syncing with start.gg.",
+      );
+      return;
+    default:
+      // A blank stream set or a missing token: purely local, nothing to say.
+      return;
+  }
+
+  try {
+    const result = await markSetInProgress({
+      apiToken: config.apiToken,
+      setId: editorSet.setId,
+    });
+
+    const current = timers.get(key);
+    // Anchor to start.gg's own start time so both clocks agree - but never
+    // resurrect a timer that was paused while the request was in flight.
+    const anchored = isRunning(current)
+      ? timerFromServerStart(result?.startedAt, Date.now())
+      : null;
+
+    timers.set(key, anchored ?? { ...current, startedOnStartgg: true });
+    setSuccess(
+      `Set ${editorSet.setId} started on start.gg - reporting the result will stop its clock.`,
+    );
+  } catch (err) {
+    // The local clock is already running and the set is being played either
+    // way, so this is a warning, not a failure to undo.
+    setError(`Timer started here, but start.gg didn't accept the start: ${String(err)}`);
+  }
+}
+
+// Resetting the timer says the set hasn't started after all, so a set this
+// app started on start.gg is un-started there too (start.gg's only way back
+// out of in-progress is a reset). Guarded to sets with no reported result -
+// SetEditor asks for a confirming click before this can touch start.gg.
+async function onResetTimer(editorSet) {
+  const key = timerKey(editorSet);
+  const previous = ensureTimer(key);
+
+  timers.set(key, resetTimer());
+  timerNow.value = Date.now();
+  lastOverlayTimerSecond = null;
+  scheduleOverlayWrite();
+
+  if (!previous.startedOnStartgg || editorSet?.completed) return;
+  if (startggSetClockBlocker(editorSet)) return;
+
+  try {
+    await resetSetResult({
+      apiToken: config.apiToken,
+      setId: editorSet.setId,
+      resetDependentSets: false,
+    });
+    setSuccess(`Set ${editorSet.setId} is no longer in progress on start.gg.`);
+  } catch (err) {
+    setError(`Timer reset here, but start.gg didn't accept un-starting the set: ${String(err)}`);
+  }
+}
+
+// Reporting a result is what ends a set's clock on start.gg, so the app's
+// own timer stops with it - frozen at the final time rather than cleared, so
+// the length of the set stays readable afterwards.
+function stopTimerForSet(setId) {
+  if (!setId) return;
+  const key = String(setId);
+  const state = timers.get(key);
+  if (!state) return;
+
+  timers.set(key, { ...pauseTimer(state, Date.now()), startedOnStartgg: false });
+  timerNow.value = Date.now();
+}
+
+// Brings a set's timer in line with what start.gg says about it: adopting
+// the server's start time for a set that's in progress (so a set started on
+// another device, or before this app was restarted, shows the right elapsed
+// time), and freezing a completed set at the duration start.gg recorded.
+// Never stomps a timer the TO is actively running or has deliberately
+// paused - that would yank the clock out from under a live set.
+// Adopts start.gg's clock for every set it currently has in progress, so the
+// bracket view can show a running timer on each of them the way start.gg's
+// own does - including sets started from another device or by another TO.
+// Completed sets are deliberately skipped: their duration is only needed
+// when one is actually opened, and freezing a timer for every finished set
+// in the tournament would be a lot of state for something nothing renders.
+function syncTimersFromTournamentData(data) {
+  for (const bucket of data?.buckets ?? []) {
+    for (const set of bucket.sets ?? []) {
+      if (Number(set.state) === 2) syncTimerFromTournamentSet(set);
+    }
+  }
+}
+
+function syncTimerFromTournamentSet(set) {
+  if (!set?.id) return;
+
+  const key = String(set.id);
+  const existing = timers.get(key);
+  const state = Number(set.state);
+
+  if (state === 3) {
+    const started = Number(set.startedAt);
+    const completed = Number(set.completedAt);
+    if (started > 0 && completed > started) {
+      timers.set(key, frozenTimer((completed - started) * 1000));
+    } else if (existing) {
+      timers.set(key, { ...pauseTimer(existing, Date.now()), startedOnStartgg: false });
+    }
+    return;
+  }
+
+  if (state !== 2 || !set.startedAt) return;
+
+  if (existing && (isRunning(existing) || elapsedMs(existing, Date.now()) > 0)) {
+    // Keep the local clock, but record that start.gg already has this set in
+    // progress so the timer isn't started there a second time.
+    if (!existing.startedOnStartgg) {
+      timers.set(key, { ...existing, startedOnStartgg: true });
+    }
+    return;
+  }
+
+  const adopted = timerFromServerStart(set.startedAt, Date.now());
+  if (!adopted) return;
+
+  timers.set(key, adopted);
+  timerNow.value = Date.now();
+  startTimerTick();
+}
+
+// --- Locally-saved (unsubmitted) results --------------------------------
+
+async function persistDrafts(nextStore) {
+  draftStore.value = nextStore;
+  try {
+    await saveLocalResults(nextStore);
+  } catch (err) {
+    // Non-fatal: the draft still exists in memory for this session.
+    console.error("Failed to save local results", err);
+  }
+}
+
+function draftFor(editorSet) {
+  return getDraft(draftStore.value, editorSet?.setId, config.tournamentSlug);
+}
+
+const streamDraft = computed(() => draftFor(streamSet.value));
+const quickReportDraft = computed(() => draftFor(quickReportSet.value));
+const draftedSetIds = computed(
+  () => new Set(draftSetIds(draftStore.value, config.tournamentSlug)),
+);
+
+// Keeps whatever was scored into an editor when the set leaves it without
+// being submitted. Sets with nothing scored (or whose result was cleared)
+// drop any existing draft instead, so the bracket doesn't keep flagging a
+// set nobody actually reported anything for.
+async function stashResultLocally(editorSet, { notify = false } = {}) {
+  if (!editorSet?.setId) return false;
+
+  const next = putDraft(draftStore.value, editorSet, config.tournamentSlug, Date.now());
+  const kept = Boolean(getDraft(next, editorSet.setId, config.tournamentSlug));
+  await persistDrafts(next);
+
+  if (notify && kept) {
+    setSuccess(
+      `Result for ${editorSet.player1.name} vs ${editorSet.player2.name} saved locally - remember to submit it to start.gg.`,
+    );
+  }
+  return kept;
+}
+
+async function discardDraft(setId) {
+  if (!setId || !getDraft(draftStore.value, setId, config.tournamentSlug)) return;
+  await persistDrafts(removeDraft(draftStore.value, setId));
+}
+
+// The editor state to open a bracket set with: its locally-saved result if
+// there is one, otherwise whatever start.gg has. A draft for a set start.gg
+// has since completed is stale by definition - drop it rather than offering
+// to re-report over a finished set.
+function editorSetForTournamentSet(set) {
+  const fresh = createEditorSetFromTournamentSet(set);
+  const draft = getDraft(draftStore.value, set.id, config.tournamentSlug);
+  if (!draft) return fresh;
+
+  if (fresh.completed) {
+    discardDraft(set.id);
+    return fresh;
+  }
+
+  const restored = cloneEditorSet(draft.editorSet);
+  restored.setId = fresh.setId;
+  restored.completed = false;
+  return restored;
+}
+
 async function refreshStreamAvatars(editorSet) {
   streamAvatars.value = { player1Avatar: null, player2Avatar: null };
 
@@ -359,8 +765,20 @@ async function loadStreamSetFromTournamentSet(set) {
     return;
   }
 
-  streamSet.value = createEditorSetFromTournamentSet(set);
-  setSuccess(`Set ${set.id} moved to stream editor.`);
+  // Whatever was on stream is about to be replaced - keep anything scored
+  // into it that never made it to start.gg.
+  const outgoing = streamSet.value;
+  if (outgoing?.setId && outgoing.setId !== set.id && hasResult(outgoing) && !outgoing.completed) {
+    await stashResultLocally(outgoing);
+  }
+
+  syncTimerFromTournamentSet(set);
+  streamSet.value = editorSetForTournamentSet(set);
+  setSuccess(
+    streamDraft.value
+      ? `Set ${set.id} moved to stream editor with its locally-saved result - remember to submit it to start.gg.`
+      : `Set ${set.id} moved to stream editor.`,
+  );
 
   // Setting streamSet above already schedules a debounced overlay write,
   // but that's a fixed 350ms timer racing an actual network fetch here - the
@@ -380,7 +798,8 @@ function openQuickReport(set) {
     return;
   }
 
-  quickReportSet.value = createEditorSetFromTournamentSet(set);
+  syncTimerFromTournamentSet(set);
+  quickReportSet.value = editorSetForTournamentSet(set);
   quickReportOpen.value = true;
 }
 
@@ -424,6 +843,44 @@ function onQuickToggleWinner(payload) {
   toggleWinner(quickReportSet, payload);
 }
 
+function applyDq(targetRef, player) {
+  updateEditorSet(targetRef, (set) => {
+    set.dq = toggleDq(set.dq, player);
+  });
+}
+
+function onStreamToggleDq(player) {
+  applyDq(streamSet, player);
+}
+
+function onQuickToggleDq(player) {
+  applyDq(quickReportSet, player);
+}
+
+function onStreamToggleTimer() {
+  onToggleTimer(streamSet.value);
+}
+
+function onStreamResetTimer() {
+  onResetTimer(streamSet.value);
+}
+
+function onQuickToggleTimer() {
+  onToggleTimer(quickReportSet.value);
+}
+
+function onQuickResetTimer() {
+  onResetTimer(quickReportSet.value);
+}
+
+function onStreamReset(payload) {
+  resetSetOnStartgg(streamSet, "stream", payload);
+}
+
+function onQuickReset(payload) {
+  resetSetOnStartgg(quickReportSet, "quick", payload);
+}
+
 function onStreamSubmit() {
   submitSet(streamSet.value, "stream");
 }
@@ -440,9 +897,17 @@ function toggleConfigPanel() {
   configPanelOpen.value = !configPanelOpen.value;
 }
 
-function closeQuickReport() {
+// Dismissing the modal (Close, backdrop click or Escape) is treated as
+// "keep this for later", not "throw it away" - a set part-way through when
+// the modal gets clicked off would otherwise silently lose its games.
+async function closeQuickReport({ keepLocalResult = true } = {}) {
+  const closing = quickReportSet.value;
   quickReportOpen.value = false;
   quickReportSet.value = null;
+
+  if (keepLocalResult && closing?.setId && !closing.completed) {
+    await stashResultLocally(closing, { notify: true });
+  }
 }
 
 function overlayRequestFromEditorSet(editorSet) {
@@ -458,16 +923,17 @@ function overlayRequestFromEditorSet(editorSet) {
       name: editorSet.player1.name || "Player 1",
       character: currentGameCharacter(editorSet, 1) || null,
       characterIcon: characterIconFile(currentGameCharacter(editorSet, 1)),
-      score: winsFor(editorSet, 1),
+      score: scoreFor(editorSet, 1),
       avatarUrl: streamAvatars.value.player1Avatar || null,
     },
     player2: {
       name: editorSet.player2.name || "Player 2",
       character: currentGameCharacter(editorSet, 2) || null,
       characterIcon: characterIconFile(currentGameCharacter(editorSet, 2)),
-      score: winsFor(editorSet, 2),
+      score: scoreFor(editorSet, 2),
       avatarUrl: streamAvatars.value.player2Avatar || null,
     },
+    timer: timerOverlayPayload(timers.get(timerKey(editorSet)), Date.now()),
   };
 }
 
@@ -599,6 +1065,8 @@ async function finishTournamentRefresh({ silent = false } = {}) {
   const bucketJustLocked = await reconcileBucketSync();
   const data = tournamentData.value;
 
+  syncTimersFromTournamentData(data);
+
   if (!data?.buckets?.find((bucket) => bucket.id === activeBucketId.value)) {
     activeBucketId.value = data?.buckets?.[0]?.id || "";
   }
@@ -609,6 +1077,7 @@ async function finishTournamentRefresh({ silent = false } = {}) {
     const allSets = (data?.buckets || []).flatMap((bucket) => bucket.sets || []);
     const matching = allSets.find((set) => set.id === streamSet.value.setId);
     if (matching) {
+      syncTimerFromTournamentSet(matching);
       const updated = createEditorSetFromTournamentSet(matching);
       updated.games.forEach((game, index) => {
         const previousGame = streamSet.value.games[index];
@@ -616,6 +1085,14 @@ async function finishTournamentRefresh({ silent = false } = {}) {
         game.player1Character = previousGame.player1Character;
         game.player2Character = previousGame.player2Character;
       });
+
+      // A refresh must never wipe scores the TO has entered but not yet
+      // submitted - start.gg simply doesn't know about those yet.
+      if (!updated.completed && !hasResult(updated) && hasResult(streamSet.value)) {
+        updated.games = cloneEditorSet(streamSet.value).games;
+        updated.dq = streamSet.value.dq;
+      }
+
       streamSet.value = updated;
     }
   }
@@ -648,6 +1125,8 @@ async function persistConfig() {
       tournamentSlug: config.tournamentSlug,
       streamOutputPath: config.streamOutputPath,
       preferredCameraId: config.preferredCameraId || null,
+      previewSourceMode: config.previewSourceMode,
+      previewWhepUrl: config.previewWhepUrl.trim(),
       perPage: Number(config.perPage) || 128,
       autoWriteOverlay: config.autoWriteOverlay,
     });
@@ -690,6 +1169,7 @@ function buildGameData(editorSet) {
 }
 
 async function submitSet(editorSet, mode) {
+  const dq = editorSet?.dq ?? null;
   const winnerId = winnerEntrantId(editorSet);
 
   if (!editorSet?.setId) {
@@ -697,8 +1177,14 @@ async function submitSet(editorSet, mode) {
     return;
   }
 
-  if (!winnerId) {
-    setError("Set a winner first (more game wins than the opponent).");
+  if (!isSubmittable(editorSet)) {
+    setError("Set a winner first (more game wins than the opponent), or mark a DQ.");
+    return;
+  }
+
+  // Every report except a double DQ (where nobody advances) needs a winner.
+  if (!winnerId && dq !== "both") {
+    setError("This set has no winner to report.");
     return;
   }
 
@@ -724,7 +1210,9 @@ async function submitSet(editorSet, mode) {
   }
 
   try {
-    const gameData = buildGameData(editorSet);
+    // A DQ isn't a played set, so it never carries per-game data - start.gg
+    // derives the -1 score from the DQ flag itself.
+    const gameData = dq ? [] : buildGameData(editorSet);
     const gameDataPayload = gameData.length ? gameData : null;
 
     if (pending) {
@@ -737,8 +1225,14 @@ async function submitSet(editorSet, mode) {
         player2EntrantId: editorSet.player2.entrantId,
         winnerEntrantId: winnerId,
         gameData: gameDataPayload,
+        isDq: Boolean(dq),
       });
       applyOptimisticResult(pending.snapshot, editorSet.setId, editorSet, winnerId);
+
+      // Queued for start.gg, so there's nothing left for the TO to remember
+      // to submit by hand, and the set is over either way.
+      await discardDraft(editorSet.setId);
+      stopTimerForSet(editorSet.setId);
 
       setSuccess(`Saved locally - will sync to start.gg once "${pending.snapshot.name}" reloads.`);
 
@@ -747,7 +1241,7 @@ async function submitSet(editorSet, mode) {
       }
 
       if (mode === "quick") {
-        closeQuickReport();
+        await closeQuickReport({ keepLocalResult: false });
       }
       return;
     }
@@ -757,9 +1251,19 @@ async function submitSet(editorSet, mode) {
       setId: editorSet.setId,
       winnerId,
       gameData: gameDataPayload,
+      isDq: Boolean(dq),
     });
 
-    setSuccess(`Reported set ${editorSet.setId} to start.gg.`);
+    // It's on start.gg now, so the locally-held copy has served its purpose,
+    // and start.gg has stopped timing the set - so this timer stops too.
+    await discardDraft(editorSet.setId);
+    stopTimerForSet(editorSet.setId);
+
+    setSuccess(
+      dq
+        ? `Reported set ${editorSet.setId} to start.gg as a DQ.`
+        : `Reported set ${editorSet.setId} to start.gg.`,
+    );
 
     if (mode === "stream") {
       await writeOverlayFromStreamSet(true);
@@ -788,10 +1292,13 @@ async function submitSet(editorSet, mode) {
       registerPendingBucket(bucketId, snapshot);
     }
 
-    await finishTournamentRefresh();
+    // Silent: the refresh is a side effect of reporting, and its generic
+    // "Loaded N sets" message would immediately bury the confirmation that
+    // this set actually made it to start.gg.
+    await finishTournamentRefresh({ silent: true });
 
     if (mode === "quick") {
-      closeQuickReport();
+      await closeQuickReport({ keepLocalResult: false });
     }
   } catch (err) {
     setError(`Failed to report set: ${String(err)}`);
@@ -800,6 +1307,76 @@ async function submitSet(editorSet, mode) {
       submittingStream.value = false;
     } else {
       submittingQuickReport.value = false;
+    }
+  }
+}
+
+// start.gg has no "edit a completed set" mutation - correcting a reported
+// result means resetting the set there and reporting it again. `keepScores`
+// is the difference between the two buttons this backs: "Edit result" keeps
+// the existing games loaded so a wrong scoreline can be adjusted and
+// resubmitted, while "Reset result" clears them for a fresh report.
+async function resetSetOnStartgg(targetRef, mode, { keepScores = false } = {}) {
+  const editorSet = targetRef.value;
+
+  if (!editorSet?.setId) {
+    setError("This set has no start.gg set ID.");
+    return;
+  }
+
+  if (!config.apiToken.trim()) {
+    setError("Missing start.gg API token.");
+    return;
+  }
+
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, editorSet.setId);
+  if (bucketSync.get(bucketId)?.locked) {
+    setError("This pool/bracket hasn't synced with start.gg yet - refresh manually before continuing.");
+    return;
+  }
+
+  if (mode === "stream") {
+    resettingStream.value = true;
+  } else {
+    resettingQuickReport.value = true;
+  }
+
+  try {
+    await resetSetResult({
+      apiToken: config.apiToken,
+      setId: editorSet.setId,
+      resetDependentSets: false,
+    });
+
+    const reopened = keepScores
+      ? { ...cloneEditorSet(editorSet), completed: false }
+      : clearResults(editorSet);
+
+    targetRef.value = reopened;
+    // resetSet clears start.gg's own start time as well as the result, so
+    // the set really is back to "not started" - including its clock.
+    if (timers.has(timerKey(editorSet))) timers.set(timerKey(editorSet), resetTimer());
+
+    setSuccess(
+      keepScores
+        ? `Set ${editorSet.setId} reset on start.gg - adjust the result and submit it again.`
+        : `Set ${editorSet.setId} reset on start.gg.`,
+    );
+
+    await fetchAndApplyTournamentData();
+    await finishTournamentRefresh({ silent: true });
+
+    // start.gg serves cached set data for up to ~60s, so the refresh above
+    // can still describe this set as completed - the reset we just made is
+    // the newer truth, so put the reopened editor state back either way.
+    targetRef.value = cloneEditorSet(reopened);
+  } catch (err) {
+    setError(`Failed to reset set: ${String(err)}`);
+  } finally {
+    if (mode === "stream") {
+      resettingStream.value = false;
+    } else {
+      resettingQuickReport.value = false;
     }
   }
 }
@@ -822,6 +1399,8 @@ watch(
   () => [config.apiToken, config.tournamentSlug],
   () => {
     bucketSync.clear();
+    timers.clear();
+    stopTimerTick();
     if (bucketSyncRetryTimer) {
       clearTimeout(bucketSyncRetryTimer);
       bucketSyncRetryTimer = null;
@@ -829,13 +1408,48 @@ watch(
   },
 );
 
+async function refreshMediaMtxStatus() {
+  try {
+    mediaMtxStatus.value = await getMediaMtxStatus();
+  } catch (err) {
+    mediaMtxStatus.value = {
+      running: false,
+      state: "error",
+      detail: `Could not read MediaMTX status: ${String(err)}`,
+    };
+  }
+}
+
+async function restartPreviewRelay() {
+  restartingMediaMtx.value = true;
+  try {
+    mediaMtxStatus.value = await restartMediaMtx();
+    setSuccess("Local preview relay restarted.");
+  } catch (err) {
+    setError(`Failed to restart local preview relay: ${String(err)}`);
+    await refreshMediaMtxStatus();
+  } finally {
+    restartingMediaMtx.value = false;
+  }
+}
+
+function onGlobalKeydown(event) {
+  if (event.key === "Escape" && quickReportOpen.value) {
+    closeQuickReport();
+  }
+}
+
 onMounted(async () => {
+  window.addEventListener("keydown", onGlobalKeydown);
+
   try {
     const loaded = await loadConfig();
     config.apiToken = loaded.apiToken || "";
     config.tournamentSlug = loaded.tournamentSlug || "";
     config.streamOutputPath = loaded.streamOutputPath || "";
     config.preferredCameraId = loaded.preferredCameraId || "";
+    config.previewSourceMode = loaded.previewSourceMode === "webrtc" ? "webrtc" : "camera";
+    config.previewWhepUrl = loaded.previewWhepUrl || "http://127.0.0.1:8889/preview/whep";
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
     configLoaded.value = true;
@@ -850,18 +1464,39 @@ onMounted(async () => {
     configLoaded.value = true;
   }
 
+  await refreshMediaMtxStatus();
+  mediaMtxStatusTimer = window.setInterval(refreshMediaMtxStatus, 5000);
+
+  try {
+    draftStore.value = normalizeDraftStore(await loadLocalResults());
+    const pendingDrafts = draftSetIds(draftStore.value, config.tournamentSlug).length;
+    if (pendingDrafts) {
+      setSuccess(
+        `${pendingDrafts} locally-saved result${pendingDrafts === 1 ? "" : "s"} not yet submitted to start.gg.`,
+      );
+    }
+  } catch (err) {
+    // Non-fatal: drafts are a convenience, not something to block start-up on.
+    console.error("Failed to load locally-saved results", err);
+  }
+
   if (!streamSet.value) {
     streamSet.value = emptyEditorSet();
   }
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
   if (overlayTimer) {
     clearTimeout(overlayTimer);
   }
   if (bucketSyncRetryTimer) {
     clearTimeout(bucketSyncRetryTimer);
   }
+  if (mediaMtxStatusTimer) {
+    clearInterval(mediaMtxStatusTimer);
+  }
+  stopTimerTick();
 });
 
 const showStatus = computed(() => Boolean(statusMessage.value));
@@ -912,6 +1547,35 @@ const showError = computed(() => Boolean(errorMessage.value));
             <input v-model="config.autoWriteOverlay" type="checkbox" />
             Auto-write overlay on stream set changes
           </label>
+
+          <label>
+            Preview source
+            <select v-model="config.previewSourceMode">
+              <option value="camera">Camera / OBS Virtual Camera</option>
+              <option value="webrtc">Local OBS WebRTC feed</option>
+            </select>
+          </label>
+
+          <label v-if="config.previewSourceMode === 'webrtc'">
+            WHEP preview URL
+            <input
+              v-model="config.previewWhepUrl"
+              type="url"
+              placeholder="http://127.0.0.1:8889/preview/whep"
+            />
+          </label>
+        </div>
+
+        <div v-if="config.previewSourceMode === 'webrtc'" class="relay-status">
+          <span :class="['relay-dot', { running: mediaMtxStatus?.running }]" />
+          <span>
+            {{ mediaMtxStatus?.detail || "Checking local preview relay…" }}
+            OBS SRT URL:
+            <code>srt://127.0.0.1:8890?streamid=publish:preview</code>
+          </span>
+          <button type="button" :disabled="restartingMediaMtx" @click="restartPreviewRelay">
+            {{ restartingMediaMtx ? "Restarting…" : "Restart relay" }}
+          </button>
         </div>
 
         <div class="top-actions">
@@ -929,21 +1593,33 @@ const showError = computed(() => Boolean(errorMessage.value));
     </section>
 
     <section class="top-grid">
-      <WebcamPanel v-if="configLoaded" v-model:camera-id="config.preferredCameraId" />
+      <WebcamPanel
+        v-if="configLoaded"
+        v-model:camera-id="config.preferredCameraId"
+        :source-mode="config.previewSourceMode"
+        :whep-url="config.previewWhepUrl"
+      />
 
       <SetEditor
         title="On Stream Set"
         :set-data="streamSet"
         :characters="SMASH_ULTIMATE_CHARACTERS"
         :submitting="submittingStream"
+        :resetting="resettingStream"
         :writing-overlay="writingOverlay"
         :allow-swap="true"
+        :timer="streamTimer"
+        :draft="streamDraft"
         @set-best-of="onStreamBestOf"
         @set-player-name="onStreamPlayerName"
         @set-game-character="onStreamGameCharacter"
         @toggle-game-winner="onStreamToggleWinner"
+        @toggle-dq="onStreamToggleDq"
         @swap-players="onStreamSwapPlayers"
         @apply-overlay="writeOverlayFromStreamSet(false)"
+        @reset-result="onStreamReset"
+        @toggle-timer="onStreamToggleTimer"
+        @reset-timer="onStreamResetTimer"
         @submit="onStreamSubmit"
       />
     </section>
@@ -952,25 +1628,34 @@ const showError = computed(() => Boolean(errorMessage.value));
       :tournament-data="tournamentData"
       :active-bucket-id="activeBucketId"
       :bucket-sync-state="bucketSync"
+      :drafted-set-ids="draftedSetIds"
+      :set-timers="liveSetTimers"
       @update:activeBucketId="onBucketChange"
       @set-on-stream="loadStreamSetFromTournamentSet"
       @quick-report="openQuickReport"
     />
 
-    <div v-if="quickReportOpen" class="modal-backdrop" @click.self="closeQuickReport">
+    <div v-if="quickReportOpen" class="modal-backdrop" @click.self="closeQuickReport()">
       <div class="modal-card">
         <SetEditor
           title="Quick Report"
           :set-data="quickReportSet"
           :characters="SMASH_ULTIMATE_CHARACTERS"
           :submitting="submittingQuickReport"
+          :resetting="resettingQuickReport"
           :show-overlay-button="false"
           :show-close="true"
-          @close="closeQuickReport"
+          :timer="quickReportTimer"
+          :draft="quickReportDraft"
+          @close="closeQuickReport()"
           @set-best-of="onQuickBestOf"
           @set-player-name="onQuickPlayerName"
           @set-game-character="onQuickGameCharacter"
           @toggle-game-winner="onQuickToggleWinner"
+          @toggle-dq="onQuickToggleDq"
+          @reset-result="onQuickReset"
+          @toggle-timer="onQuickToggleTimer"
+          @reset-timer="onQuickResetTimer"
           @submit="onQuickSubmit"
         />
       </div>
@@ -1061,8 +1746,40 @@ button:disabled {
   font-weight: 600;
 }
 
-.config-grid label input {
+.config-grid label input,
+.config-grid label select {
   font-size: 13px;
+}
+
+.relay-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.relay-status span:nth-child(2) {
+  flex: 1;
+}
+
+.relay-status code {
+  white-space: nowrap;
+}
+
+.relay-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #a11e1e;
+}
+
+.relay-dot.running {
+  background: #159447;
 }
 
 .checkbox-field {

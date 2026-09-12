@@ -2,6 +2,12 @@ export function emptyGame() {
   return { winner: null, player1Character: "", player2Character: "" };
 }
 
+// start.gg records a disqualified entrant's score as -1 (that's what its own
+// UI renders as "DQ"), so that's the value used here too - both when reading
+// an already-reported DQ back out of a fetched set and when telling the
+// overlay what to display.
+export const DQ_SCORE = -1;
+
 export function emptyEditorSet() {
   return {
     setId: null,
@@ -10,6 +16,13 @@ export function emptyEditorSet() {
     eventName: "",
     phaseName: "",
     bestOf: 5,
+    // null | 1 | 2 | "both" - which player (if any) is being reported as a
+    // no-show/disqualification. A DQ replaces the per-game result entirely
+    // rather than sitting alongside it.
+    dq: null,
+    // True once start.gg has a completed result for this set, i.e. it can't
+    // be reported again without being reset first.
+    completed: false,
     player1: {
       entrantId: null,
       name: "Player 1",
@@ -25,6 +38,17 @@ export function emptyEditorSet() {
 export function cloneEditorSet(value) {
   if (!value) return emptyEditorSet();
   return JSON.parse(JSON.stringify(value));
+}
+
+// Which player, if any, a fetched set was already DQ'd against - start.gg
+// reports that as a -1 score for whoever didn't show.
+export function dqFromTournamentSet(set) {
+  const p1Dq = Number(set?.player1?.score) === DQ_SCORE;
+  const p2Dq = Number(set?.player2?.score) === DQ_SCORE;
+  if (p1Dq && p2Dq) return "both";
+  if (p1Dq) return 1;
+  if (p2Dq) return 2;
+  return null;
 }
 
 export function createEditorSetFromTournamentSet(set) {
@@ -80,6 +104,8 @@ export function createEditorSetFromTournamentSet(set) {
     eventName: set.eventName ?? "",
     phaseName: set.phaseName ?? "",
     bestOf,
+    dq: dqFromTournamentSet(set),
+    completed: Number(set?.state) === 3 || Boolean(set?.winnerId),
     player1: {
       entrantId: set.player1?.entrantId ?? null,
       name: set.player1?.name || "Player 1",
@@ -105,9 +131,35 @@ function isSetDecided(editorSet) {
 // itself is already decided, no further (never-played) game is reportable.
 export function canReportGame(editorSet, index) {
   const games = editorSet?.games ?? [];
+  // A DQ isn't a played set - individual games stop being meaningful (and
+  // are never sent to start.gg) for as long as one is set.
+  if (editorSet?.dq) return false;
   if (isSetDecided(editorSet)) return false;
   if (index <= 0) return true;
   return Boolean(games[index - 1]?.winner);
+}
+
+// Toggles a DQ against a player: clicking the same player again clears it,
+// and DQ-ing both players is the double-DQ case (neither advances).
+export function toggleDq(currentDq, player) {
+  if (player !== 1 && player !== 2) return currentDq;
+  const other = player === 1 ? 2 : 1;
+
+  if (currentDq === player) return null;
+  if (currentDq === "both") return other;
+  if (currentDq === other) return "both";
+  return player;
+}
+
+export function isDq(editorSet, player) {
+  return editorSet?.dq === player || editorSet?.dq === "both";
+}
+
+// The score to show for a player, which is their game wins except when
+// they've been DQ'd - matching how start.gg itself scores a DQ.
+export function scoreFor(editorSet, player) {
+  if (isDq(editorSet, player)) return DQ_SCORE;
+  return winsFor(editorSet, player);
 }
 
 export function winsFor(editorSet, player) {
@@ -144,10 +196,47 @@ export function currentGameCharacter(editorSet, player) {
 }
 
 export function winnerEntrantId(editorSet) {
+  // A DQ decides the set on its own: whoever wasn't DQ'd advances, and a
+  // double DQ has no winner at all.
+  if (editorSet?.dq === "both") return null;
+  if (editorSet?.dq === 1) return editorSet?.player2?.entrantId ?? null;
+  if (editorSet?.dq === 2) return editorSet?.player1?.entrantId ?? null;
+
   const p1Wins = winsFor(editorSet, 1);
   const p2Wins = winsFor(editorSet, 2);
 
   if (p1Wins === p2Wins) return null;
   if (p1Wins > p2Wins) return editorSet?.player1?.entrantId ?? null;
   return editorSet?.player2?.entrantId ?? null;
+}
+
+// Whether this editor set holds something worth sending to start.gg - either
+// a DQ, or at least one game with a winner. Used both to gate submitting and
+// to decide whether closing a modal has anything worth keeping locally.
+export function hasResult(editorSet) {
+  if (editorSet?.dq) return true;
+  return (editorSet?.games ?? []).some((game) => game?.winner);
+}
+
+// True once the editor holds a complete, submittable outcome: a DQ (single
+// or double), or enough game wins for one player to have taken the set.
+export function isSubmittable(editorSet) {
+  if (!editorSet?.setId) return false;
+  if (editorSet.dq) return true;
+  return Boolean(winnerEntrantId(editorSet)) && isSetDecided(editorSet);
+}
+
+// Clears every reported outcome (games and DQ) while keeping the players,
+// format and character picks - what "reset this set and start over" means
+// locally, independent of resetting it on start.gg.
+export function clearResults(editorSet, { keepCharacters = true } = {}) {
+  const next = cloneEditorSet(editorSet);
+  next.dq = null;
+  next.completed = false;
+  next.games = next.games.map((game) => ({
+    winner: null,
+    player1Character: keepCharacters ? game.player1Character : "",
+    player2Character: keepCharacters ? game.player2Character : "",
+  }));
+  return next;
 }

@@ -1,7 +1,8 @@
 <script setup>
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import CharacterPicker from "./CharacterPicker.vue";
-import { canReportGame } from "../lib/set-utils";
+import { canReportGame, isDq, isSubmittable, scoreFor } from "../lib/set-utils";
+import { describeDraftAge } from "../lib/drafts";
 
 const props = defineProps({
   title: {
@@ -32,9 +33,29 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  resetting: {
+    type: Boolean,
+    default: false,
+  },
   writingOverlay: {
     type: Boolean,
     default: false,
+  },
+  // { display, running, startedOnStartgg, final } - the set timer for
+  // whichever set is loaded here, owned by App so it keeps running while the
+  // set moves between this editor and the bracket view. `startedOnStartgg`
+  // means start.gg has the set in progress (its own clock is running);
+  // `final` means the set is reported, so the clock is a duration rather
+  // than a live timer.
+  timer: {
+    type: Object,
+    default: null,
+  },
+  // { savedAt } when this set has a locally-saved result that was never
+  // submitted to start.gg, so the editor can say so on reopen.
+  draft: {
+    type: Object,
+    default: null,
   },
 });
 
@@ -44,32 +65,96 @@ const emit = defineEmits([
   "set-player-name",
   "set-game-character",
   "toggle-game-winner",
+  "toggle-dq",
   "swap-players",
   "apply-overlay",
   "submit",
+  "reset-result",
+  "toggle-timer",
+  "reset-timer",
 ]);
 
 const gameCount = computed(() => (props.setData?.bestOf === 3 ? 3 : 5));
 
-const p1Wins = computed(() => {
-  if (!props.setData?.games) return 0;
-  return props.setData.games.reduce(
-    (acc, game) => acc + (game?.winner === 1 ? 1 : 0),
-    0,
-  );
-});
-
-const p2Wins = computed(() => {
-  if (!props.setData?.games) return 0;
-  return props.setData.games.reduce(
-    (acc, game) => acc + (game?.winner === 2 ? 1 : 0),
-    0,
-  );
-});
+const p1Wins = computed(() => scoreFor(props.setData, 1));
+const p2Wins = computed(() => scoreFor(props.setData, 2));
 
 const gameIndices = computed(() =>
   Array.from({ length: gameCount.value }, (_, index) => index),
 );
+
+const canSubmit = computed(() => isSubmittable(props.setData));
+
+const dqLabel = computed(() => {
+  const dq = props.setData?.dq;
+  if (!dq) return "";
+  if (dq === "both") return "Double DQ - neither player advances.";
+  const loser = dq === 1 ? props.setData.player1.name : props.setData.player2.name;
+  const winner = dq === 1 ? props.setData.player2.name : props.setData.player1.name;
+  return `${loser} DQ'd - ${winner} advances.`;
+});
+
+const draftNotice = computed(() =>
+  props.draft
+    ? `Saved locally ${describeDraftAge(props.draft.savedAt)} and not yet submitted - remember to submit to start.gg.`
+    : "",
+);
+
+const timerStateLabel = computed(() => {
+  if (!props.timer) return "";
+  if (props.timer.final) return "Final";
+  return props.timer.running ? "Running" : "Paused";
+});
+
+// Starting the timer is also what starts the set on start.gg, so the first
+// press says so; resuming after a local pause doesn't start anything again.
+const startButtonLabel = computed(() => {
+  if (props.timer?.running) return "Pause";
+  return props.timer?.startedOnStartgg ? "Resume" : "Start set";
+});
+
+const timerNote = computed(() => {
+  if (!props.timer?.startedOnStartgg) return "";
+  if (props.timer.final) return "";
+  return props.timer.running
+    ? "In progress on start.gg - submitting the result stops its clock there."
+    : "Paused here only - start.gg still has this set in progress.";
+});
+
+// Resetting a set on start.gg undoes a result the TO already reported, so it
+// takes a deliberate second click rather than firing straight off one.
+const pendingReset = ref(null);
+
+// Same for resetting a timer that started the set on start.gg: that un-starts
+// it there, which anyone watching the bracket sees. A purely local timer
+// (nothing started on start.gg) resets on the first click as before.
+const pendingTimerReset = ref(false);
+
+watch(
+  () => props.setData?.setId,
+  () => {
+    pendingReset.value = null;
+    pendingTimerReset.value = false;
+  },
+);
+
+function requestTimerReset() {
+  if (!props.timer?.startedOnStartgg || pendingTimerReset.value) {
+    pendingTimerReset.value = false;
+    emit("reset-timer");
+    return;
+  }
+  pendingTimerReset.value = true;
+}
+
+function requestReset(mode) {
+  if (pendingReset.value === mode) {
+    pendingReset.value = null;
+    emit("reset-result", { keepScores: mode === "edit" });
+    return;
+  }
+  pendingReset.value = mode;
+}
 
 function reportLocked(index) {
   return !props.setData?.games[index]?.winner && !canReportGame(props.setData, index);
@@ -92,6 +177,35 @@ function reportLocked(index) {
     <div v-if="!setData" class="empty-state">No set selected yet.</div>
 
     <div v-else class="editor-content">
+      <p v-if="draftNotice" class="notice notice-draft">{{ draftNotice }}</p>
+      <p v-if="setData.completed" class="notice notice-reported">
+        Already reported on start.gg - reset it to report a different result.
+      </p>
+
+      <div v-if="timer" class="timer-block">
+        <div class="timer-row" :class="{ running: timer.running }">
+          <span class="timer-clock">{{ timer.display }}</span>
+          <span class="timer-state">{{ timerStateLabel }}</span>
+          <button
+            v-if="!timer.final"
+            type="button"
+            class="timer-btn timer-start-btn"
+            @click="emit('toggle-timer')"
+          >
+            {{ startButtonLabel }}
+          </button>
+          <button
+            v-if="!timer.final"
+            type="button"
+            class="timer-btn"
+            @click="requestTimerReset"
+          >
+            {{ pendingTimerReset ? "Confirm un-start?" : "Reset" }}
+          </button>
+        </div>
+        <p v-if="timerNote" class="timer-note">{{ timerNote }}</p>
+      </div>
+
       <div class="best-of-row">
         <span>Format:</span>
         <select
@@ -113,24 +227,48 @@ function reportLocked(index) {
       </div>
 
       <div class="player-grid">
-        <div class="player-box">
+        <div class="player-box" :class="{ dq: isDq(setData, 1) }">
           <label>Player 1</label>
           <input
             :value="setData.player1.name"
             @input="emit('set-player-name', { player: 1, value: $event.target.value })"
           />
-          <p class="score">{{ p1Wins }}</p>
+          <div class="player-score-row">
+            <p class="score">{{ isDq(setData, 1) ? "DQ" : p1Wins }}</p>
+            <button
+              type="button"
+              class="dq-btn"
+              :class="{ active: isDq(setData, 1) }"
+              title="Report this player as disqualified"
+              @click="emit('toggle-dq', 1)"
+            >
+              DQ
+            </button>
+          </div>
         </div>
 
-        <div class="player-box">
+        <div class="player-box" :class="{ dq: isDq(setData, 2) }">
           <label>Player 2</label>
           <input
             :value="setData.player2.name"
             @input="emit('set-player-name', { player: 2, value: $event.target.value })"
           />
-          <p class="score">{{ p2Wins }}</p>
+          <div class="player-score-row">
+            <p class="score">{{ isDq(setData, 2) ? "DQ" : p2Wins }}</p>
+            <button
+              type="button"
+              class="dq-btn"
+              :class="{ active: isDq(setData, 2) }"
+              title="Report this player as disqualified"
+              @click="emit('toggle-dq', 2)"
+            >
+              DQ
+            </button>
+          </div>
         </div>
       </div>
+
+      <p v-if="dqLabel" class="notice notice-dq">{{ dqLabel }}</p>
 
       <div class="games-list">
         <div v-for="index in gameIndices" :key="index" class="game-row" :class="{ locked: reportLocked(index) }">
@@ -174,6 +312,25 @@ function reportLocked(index) {
 
       <div class="action-row">
         <button
+          v-if="setData.completed"
+          type="button"
+          class="reset-btn"
+          :disabled="resetting"
+          @click="requestReset('edit')"
+        >
+          {{ pendingReset === "edit" ? "Confirm edit?" : "Edit result" }}
+        </button>
+        <button
+          v-if="setData.completed"
+          type="button"
+          class="reset-btn"
+          :disabled="resetting"
+          @click="requestReset('clear')"
+        >
+          {{ pendingReset === "clear" ? "Confirm reset?" : "Reset result" }}
+        </button>
+        <span class="action-spacer"></span>
+        <button
           v-if="showOverlayButton"
           type="button"
           :disabled="writingOverlay"
@@ -181,7 +338,13 @@ function reportLocked(index) {
         >
           {{ writingOverlay ? "Writing overlay…" : "Apply to Overlay" }}
         </button>
-        <button type="button" :disabled="submitting" @click="emit('submit')">
+        <button
+          type="button"
+          class="submit-btn"
+          :disabled="submitting || !canSubmit"
+          :title="canSubmit ? '' : 'Report a winner or a DQ first'"
+          @click="emit('submit')"
+        >
           {{ submitting ? "Submitting…" : "Submit to start.gg" }}
         </button>
       </div>
@@ -229,6 +392,73 @@ function reportLocked(index) {
   gap: 12px;
 }
 
+.notice {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid var(--panel-border);
+}
+
+.notice-draft {
+  border-color: #d8a300;
+  background: rgba(216, 163, 0, 0.12);
+}
+
+.notice-reported {
+  border-color: #2366d1;
+  background: rgba(35, 102, 209, 0.12);
+}
+
+.notice-dq {
+  border-color: #a11e1e;
+  background: rgba(161, 30, 30, 0.12);
+}
+
+.timer-block {
+  display: grid;
+  gap: 4px;
+}
+
+.timer-note {
+  margin: 0;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.timer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+}
+
+.timer-clock {
+  font-size: 24px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.timer-row.running .timer-clock {
+  color: #0e6b2f;
+}
+
+.timer-state {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.timer-btn {
+  font-size: 12px;
+}
+
+.timer-start-btn {
+  margin-left: auto;
+}
+
 .best-of-row {
   display: flex;
   align-items: center;
@@ -254,9 +484,20 @@ function reportLocked(index) {
   padding: 8px;
 }
 
+.player-box.dq {
+  border-color: #a11e1e;
+}
+
 .player-box label {
   font-size: 12px;
   font-weight: 600;
+}
+
+.player-score-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .score {
@@ -264,6 +505,17 @@ function reportLocked(index) {
   font-size: 26px;
   font-weight: 800;
   line-height: 1;
+}
+
+.dq-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.dq-btn.active {
+  background: #a11e1e;
+  border-color: #a11e1e;
+  color: #fff;
 }
 
 .games-list {
@@ -318,7 +570,11 @@ function reportLocked(index) {
 
 .action-row {
   display: flex;
+  align-items: center;
   gap: 8px;
-  justify-content: flex-end;
+}
+
+.action-spacer {
+  flex: 1;
 }
 </style>

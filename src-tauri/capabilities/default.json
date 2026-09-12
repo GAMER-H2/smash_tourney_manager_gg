@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Main-window core and URL-opening access. MediaMTX is controlled only through app commands; generic shell access is intentionally not granted.",
   "windows": ["main"],
   "permissions": [
     "core:default",
