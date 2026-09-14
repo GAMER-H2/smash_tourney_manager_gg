@@ -50,7 +50,8 @@ const whepStatus = computed(() => {
   if (!props.whepUrl.trim()) return "Enter a WHEP URL to start preview.";
   if (whepState.value === "connecting") return "Connecting to WebRTC preview…";
   if (whepState.value === "reconnecting") {
-    return `Preview unavailable. Reconnecting (attempt ${whepReconnectAttempts})…`;
+    const reason = error.value ? ` ${error.value}` : "";
+    return `Preview unavailable.${reason} Reconnecting (attempt ${whepReconnectAttempts})…`;
   }
   return "";
 });

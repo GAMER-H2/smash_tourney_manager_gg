@@ -89,6 +89,8 @@ npm run tauri dev
 
 ## Local OBS preview without Virtual Camera
 
+For the complete setup procedure, no-admin portable OBS instructions, an event-day checklist, and troubleshooting, see [Secondary OBS Preview Without Virtual Camera](docs/secondary-obs-preview.md).
+
 The app bundles [MediaMTX](https://github.com/bluenviron/mediamtx) `v1.21.0` as a managed sidecar. It starts with the app and converts a loopback SRT feed from OBS into browser-compatible WebRTC/WHEP:
 
 ```text
