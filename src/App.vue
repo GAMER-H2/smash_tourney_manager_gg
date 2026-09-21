@@ -8,13 +8,11 @@ import {
   fetchEntrantAvatars,
   fetchGameCharacters,
   fetchTournamentState,
-  getMediaMtxStatus,
   loadConfig,
   loadLocalResults,
   markSetInProgress,
   reportSetResult,
   resetSetResult,
-  restartMediaMtx,
   saveConfig,
   saveLocalResults,
   writeStreamOverlay,
@@ -65,8 +63,8 @@ const config = reactive({
   tournamentSlug: "",
   streamOutputPath: "",
   preferredCameraId: "",
-  previewSourceMode: "camera",
-  previewWhepUrl: "http://127.0.0.1:8889/preview/whep",
+  previewSourceMode: "auto",
+  overlayLayoutUrl: "",
   perPage: 128,
   autoWriteOverlay: true,
 });
@@ -87,8 +85,6 @@ const resettingStream = ref(false);
 const resettingQuickReport = ref(false);
 const writingOverlay = ref(false);
 const savingConfig = ref(false);
-const restartingMediaMtx = ref(false);
-const mediaMtxStatus = ref(null);
 
 const statusMessage = ref("");
 const errorMessage = ref("");
@@ -140,7 +136,6 @@ let overlayTimer = null;
 let bucketSyncRetryTimer = null;
 let timerTickHandle = null;
 let lastOverlayTimerSecond = null;
-let mediaMtxStatusTimer = null;
 
 function setSuccess(message) {
   errorMessage.value = "";
@@ -1126,7 +1121,7 @@ async function persistConfig() {
       streamOutputPath: config.streamOutputPath,
       preferredCameraId: config.preferredCameraId || null,
       previewSourceMode: config.previewSourceMode,
-      previewWhepUrl: config.previewWhepUrl.trim(),
+      overlayLayoutUrl: config.overlayLayoutUrl.trim(),
       perPage: Number(config.perPage) || 128,
       autoWriteOverlay: config.autoWriteOverlay,
     });
@@ -1408,31 +1403,6 @@ watch(
   },
 );
 
-async function refreshMediaMtxStatus() {
-  try {
-    mediaMtxStatus.value = await getMediaMtxStatus();
-  } catch (err) {
-    mediaMtxStatus.value = {
-      running: false,
-      state: "error",
-      detail: `Could not read MediaMTX status: ${String(err)}`,
-    };
-  }
-}
-
-async function restartPreviewRelay() {
-  restartingMediaMtx.value = true;
-  try {
-    mediaMtxStatus.value = await restartMediaMtx();
-    setSuccess("Local preview relay restarted.");
-  } catch (err) {
-    setError(`Failed to restart local preview relay: ${String(err)}`);
-    await refreshMediaMtxStatus();
-  } finally {
-    restartingMediaMtx.value = false;
-  }
-}
-
 function onGlobalKeydown(event) {
   if (event.key === "Escape" && quickReportOpen.value) {
     closeQuickReport();
@@ -1448,8 +1418,12 @@ onMounted(async () => {
     config.tournamentSlug = loaded.tournamentSlug || "";
     config.streamOutputPath = loaded.streamOutputPath || "";
     config.preferredCameraId = loaded.preferredCameraId || "";
-    config.previewSourceMode = loaded.previewSourceMode === "webrtc" ? "webrtc" : "camera";
-    config.previewWhepUrl = loaded.previewWhepUrl || "http://127.0.0.1:8889/preview/whep";
+    config.previewSourceMode = ["auto", "virtualcam", "overlay"].includes(
+      loaded.previewSourceMode,
+    )
+      ? loaded.previewSourceMode
+      : "auto";
+    config.overlayLayoutUrl = loaded.overlayLayoutUrl || "";
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
     configLoaded.value = true;
@@ -1463,9 +1437,6 @@ onMounted(async () => {
     setError(`Could not load saved settings: ${String(err)}`);
     configLoaded.value = true;
   }
-
-  await refreshMediaMtxStatus();
-  mediaMtxStatusTimer = window.setInterval(refreshMediaMtxStatus, 5000);
 
   try {
     draftStore.value = normalizeDraftStore(await loadLocalResults());
@@ -1493,9 +1464,6 @@ onBeforeUnmount(() => {
   if (bucketSyncRetryTimer) {
     clearTimeout(bucketSyncRetryTimer);
   }
-  if (mediaMtxStatusTimer) {
-    clearInterval(mediaMtxStatusTimer);
-  }
   stopTimerTick();
 });
 
@@ -1508,9 +1476,19 @@ const showError = computed(() => Boolean(errorMessage.value));
     <section class="config-panel">
       <header class="config-panel-header">
         <h1>Tournament Stream Manager</h1>
-        <button type="button" class="collapse-toggle" @click="toggleConfigPanel">
-          {{ configPanelOpen ? "Hide settings ▲" : "Show settings ▼" }}
-        </button>
+        <div class="header-actions">
+          <button
+            v-if="!configPanelOpen"
+            type="button"
+            :disabled="loadingTournament"
+            @click="refreshTournament"
+          >
+            {{ loadingTournament ? "Loading…" : "Refresh Tournament" }}
+          </button>
+          <button type="button" class="collapse-toggle" @click="toggleConfigPanel">
+            {{ configPanelOpen ? "Hide settings ▲" : "Show settings ▼" }}
+          </button>
+        </div>
       </header>
 
       <div v-show="configPanelOpen">
@@ -1551,31 +1529,20 @@ const showError = computed(() => Boolean(errorMessage.value));
           <label>
             Preview source
             <select v-model="config.previewSourceMode">
-              <option value="camera">Camera / OBS Virtual Camera</option>
-              <option value="webrtc">Local OBS WebRTC feed</option>
+              <option value="auto">Auto (prefer OBS Virtual Camera)</option>
+              <option value="virtualcam">OBS Virtual Camera only</option>
+              <option value="overlay">Capture card + overlay</option>
             </select>
           </label>
 
-          <label v-if="config.previewSourceMode === 'webrtc'">
-            WHEP preview URL
+          <label>
+            Overlay layout URL or file
             <input
-              v-model="config.previewWhepUrl"
-              type="url"
-              placeholder="http://127.0.0.1:8889/preview/whep"
+              v-model="config.overlayLayoutUrl"
+              type="text"
+              placeholder="The same index.html the OBS browser source uses"
             />
           </label>
-        </div>
-
-        <div v-if="config.previewSourceMode === 'webrtc'" class="relay-status">
-          <span :class="['relay-dot', { running: mediaMtxStatus?.running }]" />
-          <span>
-            {{ mediaMtxStatus?.detail || "Checking local preview relay…" }}
-            OBS SRT URL:
-            <code>srt://127.0.0.1:8890?streamid=publish:preview</code>
-          </span>
-          <button type="button" :disabled="restartingMediaMtx" @click="restartPreviewRelay">
-            {{ restartingMediaMtx ? "Restarting…" : "Restart relay" }}
-          </button>
         </div>
 
         <div class="top-actions">
@@ -1597,7 +1564,7 @@ const showError = computed(() => Boolean(errorMessage.value));
         v-if="configLoaded"
         v-model:camera-id="config.preferredCameraId"
         :source-mode="config.previewSourceMode"
-        :whep-url="config.previewWhepUrl"
+        :overlay-url="config.overlayLayoutUrl"
       />
 
       <SetEditor
@@ -1728,7 +1695,13 @@ button:disabled {
   font-size: 18px;
 }
 
-.collapse-toggle {
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-actions button {
   font-size: 12px;
   white-space: nowrap;
 }
@@ -1749,37 +1722,6 @@ button:disabled {
 .config-grid label input,
 .config-grid label select {
   font-size: 13px;
-}
-
-.relay-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--panel-border);
-  border-radius: 6px;
-  font-size: 12px;
-}
-
-.relay-status span:nth-child(2) {
-  flex: 1;
-}
-
-.relay-status code {
-  white-space: nowrap;
-}
-
-.relay-dot {
-  width: 9px;
-  height: 9px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: #a11e1e;
-}
-
-.relay-dot.running {
-  background: #159447;
 }
 
 .checkbox-field {

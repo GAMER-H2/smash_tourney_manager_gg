@@ -48,10 +48,6 @@ export async function getPlatform() {
   return invoke("get_platform");
 }
 
-export async function getMediaMtxStatus() {
-  return invoke("get_mediamtx_status");
-}
-
-export async function restartMediaMtx() {
-  return invoke("restart_mediamtx");
+export async function allowOverlayLayoutPath(path) {
+  return invoke("allow_overlay_layout_path", { path });
 }

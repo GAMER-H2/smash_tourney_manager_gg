@@ -2,7 +2,7 @@
 
 A desktop TO tool for Smash Ultimate streams:
 
-- **Top-left:** webcam/OBS virtual camera preview + fullscreen
+- **Top-left:** webcam / capture-card / OBS virtual camera preview + fullscreen
 - **Top-right:** on-stream set editor (characters, per-game winners, DQs, set timer, submit to start.gg)
 - **Bottom:** tournament set browser with tabs and bracket-style columns
   - **Left-click:** open quick-report modal
@@ -87,68 +87,38 @@ npm run tauri dev
 4. Click **Save Settings**.
 5. Click **Refresh Tournament**.
 
-## Local OBS preview without Virtual Camera
+## Video preview
 
-For the complete setup procedure, no-admin portable OBS instructions, an event-day checklist, and troubleshooting, see [Secondary OBS Preview Without Virtual Camera](docs/secondary-obs-preview.md).
+The preview panel has two modes, and **Auto** picks between them so the same
+configuration works on every machine:
 
-The app bundles [MediaMTX](https://github.com/bluenviron/mediamtx) `v1.21.0` as a managed sidecar. It starts with the app and converts a loopback SRT feed from OBS into browser-compatible WebRTC/WHEP:
+1. **OBS Virtual Camera** — the real program feed, including transitions and
+   every scene. Preferred whenever a virtual camera is enumerated.
+2. **Capture card + overlay** — the capture card's UVC feed with the stream
+   layout composited over it. Used automatically when there is no virtual
+   camera.
 
-```text
-OBS normal stream -> Twitch
-OBS Custom FFmpeg recording -> SRT -> bundled MediaMTX -> WHEP -> app video panel
-```
+OBS registers its virtual camera machine-wide, which needs administrator
+rights, so a locked-down tournament account running portable OBS normally has
+no virtual camera at all. `scripts/register-obs-virtualcam-peruser.ps1`
+registers the filter for the current user instead, and the app launches its
+webview with `--disable-features=MediaFoundationVideoCapture` so camera
+enumeration happens in-process under that user's registry hive rather than in
+the Windows Camera Frame Server service, which can only see machine-wide
+registrations. See
+[OBS Virtual Camera on a no-admin Windows 11 account](docs/no-admin-obs-virtual-camera.md).
 
-Only loopback listeners are enabled, so this setup does not need an inbound Windows Firewall rule and cannot be viewed by other LAN computers. The bundled relay listens on:
+If that doesn't work on a given machine, the fallback needs no OBS
+configuration at all — point the app at the same layout `index.html` the OBS
+browser source uses and it composites it over the capture card feed. It is a
+reconstruction rather than true program out, so it won't show scene switches;
+see [Capture card preview](docs/capture-card-preview.md) for what it does and
+doesn't prove.
 
-- OBS publish URL: `srt://127.0.0.1:8890?streamid=publish:preview`
-- App WHEP URL: `http://127.0.0.1:8889/preview/whep`
-- WebRTC media: `127.0.0.1:8189/UDP`
-
-RTSP, RTMP, HLS, Media-over-QUIC, the MediaMTX API, metrics, recording, and playback services are disabled.
-
-### OBS configuration
-
-Keep `Settings -> Stream` configured for Twitch as normal. Configure the second output under `Settings -> Output`:
-
-1. Set **Output Mode** to **Advanced**.
-2. Open **Recording**.
-3. Set **Type** to **Custom Output (FFmpeg)**.
-4. Set **FFmpeg Output Type** to **Output to URL**.
-5. Enter `srt://127.0.0.1:8890?streamid=publish:preview` as the URL.
-6. Set **Container Format** to `mpegts`.
-7. Select an H.264 encoder and use `yuv420p`.
-8. Start with a 1280x720 rescale, 2500-4000 Kbps, and a one-second keyframe interval. Custom FFmpeg output generally follows OBS's global frame rate, so a 60 FPS Twitch project will usually make this output 60 FPS too.
-9. Disable B-frames (`bf=0`) and use a low-latency encoder preset. Browser WebRTC cannot display H.264 B-frames.
-10. Disable the custom output's audio encoder for the initial video-only preview.
-
-OBS exposes custom encoder controls differently for x264, NVENC, Quick Sync, and AMF. Verify that the selected encoder actually applies zero B-frames. If the WHEP connection succeeds but the picture remains blank, B-frames or an unsupported H.264 pixel format/profile are the first settings to check.
-
-OBS treats this second network output as recording. Start **Recording** in addition to **Streaming**, or enable **Automatically record when streaming** in OBS's general/output settings.
-
-### App configuration
-
-1. Open the app settings.
-2. Set **Preview source** to **Local OBS WebRTC feed**.
-3. Leave **WHEP preview URL** as `http://127.0.0.1:8889/preview/whep`.
-4. Confirm the relay status is green. Use **Restart relay** if it is not.
-5. Click **Save Settings**.
-6. Start the custom OBS recording output. The preview reconnects automatically if OBS starts later or restarts.
-
-The existing **Fullscreen** button works for both camera and WebRTC sources.
-
-### No-admin Windows deployment
-
-- OBS: use the official ZIP in a user-writable folder with `portable_mode.txt`, not `Program Files`.
-- This app: the NSIS bundle is explicitly configured for `currentUser` installation, which does not request machine-wide installation. Build/sign it on a development machine, then run the generated NSIS installer as the tournament Windows user.
-- MediaMTX: is included in the app bundle and launched as a child process; it is not installed as a service and does not require elevation.
-- Firewall: all listeners are bound to `127.0.0.1`, so no inbound firewall exception is expected. This intentionally supports a preview in the app on the same PC only.
-- Keep the OBS portable directory and its scene media in paths writable by the tournament user. OBS notes that referenced scene files do not automatically become portable.
-
-Bundled MediaMTX version, archive checksums, and license are recorded in `src-tauri/MEDIAMTX-VERSION.txt` and `src-tauri/MEDIAMTX-LICENSE.txt`.
-
-### Optional CachyOS test
-
-The repository also includes the x86-64 Linux MediaMTX sidecar. Run `npm run tauri dev`, configure OBS with the same SRT URL and custom FFmpeg output, then select **Local OBS WebRTC feed** in the app. This path does not use the Linux virtual-camera workaround.
+A previous build bundled MediaMTX and read a second loopback OBS output over
+SRT/WHEP as a way around the same admin restriction. It was removed: the
+OBS-side setup was too involved for event day, and the picture was too soft and
+too delayed for commentary.
 
 ## Notes on start.gg reporting
 

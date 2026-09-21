@@ -21,21 +21,17 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     },
     "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": [
-      "binaries/mediamtx"
-    ],
-    "resources": [
-      "mediamtx.yml",
-      "MEDIAMTX-LICENSE.txt",
-      "MEDIAMTX-VERSION.txt"
-    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser"

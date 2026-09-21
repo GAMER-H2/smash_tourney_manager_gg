@@ -1,19 +1,19 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { getPlatform } from "../lib/api";
-import { WhepClient } from "../lib/whep";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { allowOverlayLayoutPath, getPlatform } from "../lib/api";
 
 const props = defineProps({
-  sourceMode: {
-    type: String,
-    default: "camera",
-    validator: (value) => ["camera", "webrtc"].includes(value),
-  },
   cameraId: {
     type: String,
     default: "",
   },
-  whepUrl: {
+  sourceMode: {
+    type: String,
+    default: "auto",
+    validator: (value) => ["auto", "virtualcam", "overlay"].includes(value),
+  },
+  overlayUrl: {
     type: String,
     default: "",
   },
@@ -23,37 +23,54 @@ const emit = defineEmits(["update:cameraId"]);
 
 const cameras = ref([]);
 const videoEl = ref(null);
+const stageEl = ref(null);
+const overlayFrameEl = ref(null);
 const stream = ref(null);
 const error = ref("");
 const loading = ref(false);
 const isLinux = ref(false);
-const whepState = ref("idle");
+const overlaySrc = ref("");
+const overlayError = ref("");
+const stageWidth = ref(0);
+const overlayReloadKey = ref(0);
 
-const MAX_WHEP_RECONNECT_DELAY_MS = 10_000;
-let whepClient = null;
-let whepRequestId = 0;
-let whepReconnectAttempts = 0;
-let whepReconnectTimer = null;
+// OBS names its virtual camera device consistently across platforms, and it is
+// the only device whose picture is already the finished program feed. Matching
+// on the label is the only signal available - getUserMedia deviceIds are
+// opaque and rotate per origin.
+const VIRTUAL_CAMERA_LABEL = /obs\s*virtual/i;
 
-const whepStateLabel = computed(
-  () =>
-    ({
-      idle: "Idle",
-      connecting: "Connecting",
-      connected: "Connected",
-      reconnecting: "Reconnecting",
-      error: "Error",
-    })[whepState.value],
+// Layouts are authored against OBS's canvas, so the iframe renders at a fixed
+// 1920x1080 and gets scaled down to whatever width the panel has. Scaling the
+// iframe rather than resizing it keeps the layout's own absolute positioning
+// intact.
+const LAYOUT_WIDTH = 1920;
+const LAYOUT_HEIGHT = 1080;
+
+const virtualCamera = computed(() =>
+  cameras.value.find((camera) => VIRTUAL_CAMERA_LABEL.test(camera.label)),
 );
 
-const whepStatus = computed(() => {
-  if (!props.whepUrl.trim()) return "Enter a WHEP URL to start preview.";
-  if (whepState.value === "connecting") return "Connecting to WebRTC preview…";
-  if (whepState.value === "reconnecting") {
-    const reason = error.value ? ` ${error.value}` : "";
-    return `Preview unavailable.${reason} Reconnecting (attempt ${whepReconnectAttempts})…`;
-  }
-  return "";
+// "auto" is a preference for the virtual camera, not a hard requirement: if
+// the no-admin registration didn't take on this machine, no virtual camera is
+// enumerated and the capture-card-plus-overlay preview takes over without
+// anyone having to change a setting at the venue.
+const effectiveMode = computed(() => {
+  if (props.sourceMode !== "auto") return props.sourceMode;
+  return virtualCamera.value ? "virtualcam" : "overlay";
+});
+
+const showOverlay = computed(() => effectiveMode.value === "overlay" && Boolean(overlaySrc.value));
+
+const overlayStyle = computed(() => ({
+  width: `${LAYOUT_WIDTH}px`,
+  height: `${LAYOUT_HEIGHT}px`,
+  transform: `scale(${stageWidth.value ? stageWidth.value / LAYOUT_WIDTH : 0})`,
+}));
+
+const modeLabel = computed(() => {
+  if (effectiveMode.value === "virtualcam") return "OBS Virtual Camera";
+  return "Capture card + overlay";
 });
 
 function stopStream() {
@@ -97,7 +114,18 @@ async function refreshCameras() {
         label: device.label || `Camera ${index + 1}`,
       }));
 
-    if (!props.cameraId && cameras.value.length > 0) {
+    // In auto mode the virtual camera is the whole point, so select it when
+    // it shows up - unless the operator has already picked something else by
+    // hand this session, in which case leave their choice alone.
+    const preferred =
+      props.sourceMode === "auto" && !userPickedCamera.value
+        ? virtualCamera.value
+        : undefined;
+    const stillPresent = cameras.value.some((camera) => camera.deviceId === props.cameraId);
+
+    if (preferred && props.cameraId !== preferred.deviceId) {
+      emit("update:cameraId", preferred.deviceId);
+    } else if (!stillPresent && cameras.value.length > 0) {
       emit("update:cameraId", cameras.value[0].deviceId);
     }
   } catch (err) {
@@ -111,75 +139,64 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function disposeWhep() {
-  clearTimeout(whepReconnectTimer);
-  whepReconnectTimer = null;
-  whepClient?.close();
-  whepClient = null;
+const userPickedCamera = ref(false);
+
+function onCameraPicked(deviceId) {
+  userPickedCamera.value = true;
+  emit("update:cameraId", deviceId);
 }
 
-function scheduleWhepReconnect(requestId) {
-  if (
-    requestId !== whepRequestId ||
-    props.sourceMode !== "webrtc" ||
-    whepReconnectTimer
-  ) {
+// An http(s) layout URL can be framed as-is. A local path - which is what an
+// OBS browser source pointed at a file actually holds - cannot: the webview
+// document has an http origin and is not allowed to frame file://. Tauri's
+// asset protocol re-serves the layout's directory over a real origin instead,
+// which also keeps the layout's relative CSS/JS and its program_state.json
+// polling working.
+async function resolveOverlaySrc() {
+  const raw = props.overlayUrl.trim();
+  overlayError.value = "";
+
+  if (!raw) {
+    overlaySrc.value = "";
     return;
   }
 
-  whepReconnectAttempts++;
-  whepState.value = "reconnecting";
-  const delay = Math.min(1000 * 2 ** Math.min(whepReconnectAttempts - 1, 4), MAX_WHEP_RECONNECT_DELAY_MS);
-  whepReconnectTimer = setTimeout(() => {
-    whepReconnectTimer = null;
-    connectWhep(false);
-  }, delay);
-}
-
-async function connectWhep(resetReconnects = true) {
-  const requestId = ++whepRequestId;
-  disposeWhep();
-  latestRequestId++;
-  stopStream();
-
-  if (resetReconnects) whepReconnectAttempts = 0;
-  error.value = "";
-
-  if (!props.whepUrl.trim()) {
-    whepState.value = "idle";
+  if (/^https?:\/\//i.test(raw)) {
+    overlaySrc.value = raw;
     return;
   }
 
-  whepState.value = whepReconnectAttempts > 0 ? "reconnecting" : "connecting";
+  let path = raw;
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      path = decodeURIComponent(new URL(raw).pathname);
+      // file:///C:/... parses to a pathname with a leading slash Windows
+      // rejects; drop it when what follows looks like a drive letter.
+      if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+    } catch {
+      overlaySrc.value = "";
+      overlayError.value = `Overlay layout URL is not valid: ${raw}`;
+      return;
+    }
+  }
 
   try {
-    const client = new WhepClient({
-      endpoint: props.whepUrl,
-      videoElement: videoEl.value,
-      onStateChange(state) {
-        if (requestId !== whepRequestId || client !== whepClient) return;
-
-        if (state === "connected") {
-          clearTimeout(whepReconnectTimer);
-          whepReconnectTimer = null;
-          whepReconnectAttempts = 0;
-          whepState.value = "connected";
-          error.value = "";
-        } else if (state === "failed" || state === "disconnected" || state === "closed") {
-          error.value = "WebRTC preview connection was lost.";
-          scheduleWhepReconnect(requestId);
-        } else if (state === "connecting" && whepReconnectAttempts === 0) {
-          whepState.value = "connecting";
-        }
-      },
-    });
-    whepClient = client;
-    await client.connect();
+    const canonical = await allowOverlayLayoutPath(path);
+    overlaySrc.value = convertFileSrc(canonical);
   } catch (err) {
-    if (requestId !== whepRequestId || err?.name === "AbortError") return;
-    error.value = `Failed to start WebRTC preview: ${err?.message || err}`;
-    scheduleWhepReconnect(requestId);
+    overlaySrc.value = "";
+    overlayError.value = `Could not load overlay layout: ${String(err)}`;
   }
+}
+
+function reloadOverlay() {
+  overlayReloadKey.value++;
+}
+
+let stageObserver = null;
+
+function measureStage() {
+  stageWidth.value = stageEl.value?.clientWidth || 0;
 }
 
 // The very first capture pipeline built right after app launch can silently
@@ -296,7 +313,9 @@ async function startPreview(deviceId) {
 }
 
 async function goFullscreen() {
-  const el = videoEl.value;
+  // With the overlay composited on top, the video element alone is not the
+  // picture - the stage wrapper holding both is.
+  const el = showOverlay.value ? stageEl.value : videoEl.value;
   if (!el) return;
 
   if (document.fullscreenElement || document.webkitFullscreenElement) {
@@ -325,30 +344,15 @@ async function goFullscreen() {
 
 watch(
   () => props.cameraId,
-  (deviceId) => {
-    if (props.sourceMode === "camera") startPreview(deviceId);
-  },
+  (deviceId) => startPreview(deviceId),
 );
 
-watch(
-  () => [props.sourceMode, props.whepUrl],
-  async ([sourceMode], [previousSourceMode]) => {
-    error.value = "";
+watch(() => props.overlayUrl, resolveOverlaySrc);
 
-    if (sourceMode === "webrtc") {
-      await connectWhep(true);
-      return;
-    }
-
-    if (previousSourceMode !== "webrtc") return;
-
-    ++whepRequestId;
-    disposeWhep();
-    whepState.value = "idle";
-    await refreshCameras();
-    if (props.cameraId) await startPreview(props.cameraId);
-  },
-);
+watch(showOverlay, async () => {
+  await nextTick();
+  measureStage();
+});
 
 onMounted(async () => {
   try {
@@ -357,20 +361,23 @@ onMounted(async () => {
     isLinux.value = false;
   }
 
-  if (props.sourceMode === "webrtc") {
-    await connectWhep(true);
-  } else {
-    await refreshCameras();
-    if (props.cameraId) {
-      await startPreview(props.cameraId);
-    }
+  await resolveOverlaySrc();
+  await refreshCameras();
+  if (props.cameraId) {
+    await startPreview(props.cameraId);
   }
+
+  if (typeof ResizeObserver !== "undefined") {
+    stageObserver = new ResizeObserver(measureStage);
+    if (stageEl.value) stageObserver.observe(stageEl.value);
+  }
+  measureStage();
 });
 
 onBeforeUnmount(() => {
   ++latestRequestId;
-  ++whepRequestId;
-  disposeWhep();
+  stageObserver?.disconnect();
+  stageObserver = null;
   stopStream();
 });
 </script>
@@ -380,43 +387,57 @@ onBeforeUnmount(() => {
     <header class="panel-header">
       <h2>Video Source</h2>
       <div class="controls">
-        <template v-if="sourceMode === 'camera'">
-          <select :value="cameraId" @change="emit('update:cameraId', $event.target.value)">
-            <option value="">Select a camera…</option>
-            <option v-for="camera in cameras" :key="camera.deviceId" :value="camera.deviceId">
-              {{ camera.label }}
-            </option>
-          </select>
+        <span class="source-label">{{ modeLabel }}</span>
 
-          <button type="button" @click="refreshCameras">Refresh</button>
-        </template>
-        <template v-else>
-          <span class="source-label">WebRTC · {{ whepStateLabel }}</span>
-          <button type="button" @click="connectWhep(true)">Retry</button>
-        </template>
+        <select :value="cameraId" @change="onCameraPicked($event.target.value)">
+          <option value="">Select a camera…</option>
+          <option v-for="camera in cameras" :key="camera.deviceId" :value="camera.deviceId">
+            {{ camera.label }}
+          </option>
+        </select>
+
+        <button type="button" @click="refreshCameras">Refresh</button>
+        <button v-if="showOverlay" type="button" @click="reloadOverlay">Reload overlay</button>
         <button type="button" @click="goFullscreen">Fullscreen</button>
       </div>
     </header>
 
-    <p v-if="sourceMode === 'camera' && isLinux" class="linux-note">
+    <p v-if="isLinux" class="linux-note">
       On Linux, OBS Virtual Camera preview doesn't work due to a WebKitGTK bug (filed upstream).
       Physical cameras work normally.
     </p>
 
-    <div class="preview-wrapper">
+    <p v-if="effectiveMode === 'overlay' && overlayError" class="linux-note">
+      {{ overlayError }}
+    </p>
+    <p
+      v-else-if="effectiveMode === 'overlay' && !overlayUrl.trim()"
+      class="linux-note"
+    >
+      No OBS Virtual Camera found. Set an overlay layout URL in settings to
+      composite the stream layout over the capture card feed.
+    </p>
+
+    <div ref="stageEl" class="preview-wrapper" :class="{ composited: showOverlay }">
       <video ref="videoEl" muted playsinline autoplay class="preview cover" />
 
-      <template v-if="sourceMode === 'camera'">
-        <p v-if="loading" class="status">Loading cameras…</p>
-        <p v-else-if="error" class="status error">{{ error }}</p>
-        <p v-else-if="!cameraId" class="status">Select a camera to start preview.</p>
-      </template>
-      <template v-else>
-        <p v-if="error && whepState === 'error'" class="status error">{{ error }}</p>
-        <p v-else-if="whepStatus" class="status" :class="{ error: error }">
-          {{ whepStatus }}
-        </p>
-      </template>
+      <!-- pointer-events are off so the layout never swallows clicks meant for
+           the app, and the iframe is keyed on a counter so "Reload overlay"
+           picks up edits to the layout without restarting the app. -->
+      <iframe
+        v-if="showOverlay"
+        :key="overlayReloadKey"
+        ref="overlayFrameEl"
+        class="overlay-frame"
+        :src="overlaySrc"
+        :style="overlayStyle"
+        scrolling="no"
+        title="Stream overlay layout"
+      />
+
+      <p v-if="loading" class="status">Loading cameras…</p>
+      <p v-else-if="error" class="status error">{{ error }}</p>
+      <p v-else-if="!cameraId" class="status">Select a camera to start preview.</p>
     </div>
   </section>
 </template>
@@ -476,6 +497,25 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   background: #111;
+  overflow: hidden;
+}
+
+/* Pinning the stage to 16:9 is what makes the overlay line up: the capture
+   card's picture fills it exactly, so scaling the layout to the stage's width
+   puts every element where OBS would put it. */
+.preview-wrapper.composited {
+  aspect-ratio: 16 / 9;
+  min-height: 0;
+}
+
+.overlay-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 0;
+  transform-origin: top left;
+  pointer-events: none;
+  background: transparent;
 }
 
 .preview {

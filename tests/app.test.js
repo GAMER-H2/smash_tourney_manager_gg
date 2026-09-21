@@ -16,8 +16,6 @@ const BASE_CONFIG = {
   tournamentSlug: "tournament/test/event/ultimate-singles",
   streamOutputPath: "/tmp/program_state.json",
   preferredCameraId: "",
-  previewSourceMode: "camera",
-  previewWhepUrl: "http://127.0.0.1:8889/preview/whep",
   perPage: 128,
   autoWriteOverlay: true,
 };
@@ -114,22 +112,6 @@ beforeEach(() => {
         return null;
       case "get_platform":
         return "linux";
-      case "get_mediamtx_status":
-        return {
-          running: true,
-          state: "running",
-          pid: 1234,
-          detail: "MediaMTX is running.",
-          lastError: null,
-        };
-      case "restart_mediamtx":
-        return {
-          running: true,
-          state: "running",
-          pid: 1235,
-          detail: "MediaMTX restarted.",
-          lastError: null,
-        };
       default:
         throw new Error(`unexpected command ${command}`);
     }

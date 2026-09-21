@@ -4,28 +4,15 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    sync::Mutex,
-    thread,
-    time::{Duration, Instant},
 };
-use tauri::{path::BaseDirectory, AppHandle, Manager};
-use tauri_plugin_shell::{
-    process::{CommandChild, CommandEvent},
-    ShellExt,
-};
+use tauri::{AppHandle, Manager};
 
 const START_GG_GQL_URL: &str = "https://api.start.gg/gql/alpha";
-const DEFAULT_PREVIEW_SOURCE_MODE: &str = "camera";
-const DEFAULT_PREVIEW_WHEP_URL: &str = "http://127.0.0.1:8889/preview/whep";
+const DEFAULT_PREVIEW_SOURCE_MODE: &str = "auto";
 
 fn default_preview_source_mode() -> String {
     DEFAULT_PREVIEW_SOURCE_MODE.to_string()
-}
-
-fn default_preview_whep_url() -> String {
-    DEFAULT_PREVIEW_WHEP_URL.to_string()
 }
 
 // Bundled at compile time so the character icons this app already ships in
@@ -45,10 +32,15 @@ struct AppConfig {
     preferred_camera_id: Option<String>,
     per_page: u32,
     auto_write_overlay: bool,
+    // "auto" prefers the OBS Virtual Camera when one is enumerated and falls
+    // back to the capture-card-plus-overlay preview; "virtualcam" and
+    // "overlay" pin one of them.
     #[serde(default = "default_preview_source_mode")]
     preview_source_mode: String,
-    #[serde(default = "default_preview_whep_url")]
-    preview_whep_url: String,
+    // The same thing the OBS browser source points at: an http(s) URL, or a
+    // local path / file:// URL to the layout's index.html.
+    #[serde(default)]
+    overlay_layout_url: String,
 }
 
 impl Default for AppConfig {
@@ -61,7 +53,7 @@ impl Default for AppConfig {
             per_page: 128,
             auto_write_overlay: true,
             preview_source_mode: default_preview_source_mode(),
-            preview_whep_url: default_preview_whep_url(),
+            overlay_layout_url: String::new(),
         }
     }
 }
@@ -296,224 +288,6 @@ fn config_file_path() -> Result<PathBuf, String> {
     fs::create_dir_all(&base).map_err(|e| format!("Failed to create config directory: {e}"))?;
     base.push("config.json");
     Ok(base)
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaMtxStatus {
-    running: bool,
-    state: String,
-    pid: Option<u32>,
-    detail: String,
-    last_error: Option<String>,
-}
-
-impl Default for MediaMtxStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            state: "stopped".to_string(),
-            pid: None,
-            detail: "MediaMTX has not been started yet.".to_string(),
-            last_error: None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct MediaMtxLifecycle {
-    generation: u64,
-    child: Option<CommandChild>,
-    status: MediaMtxStatus,
-}
-
-#[derive(Default)]
-struct MediaMtxState(Mutex<MediaMtxLifecycle>);
-
-fn mediamtx_failure(error: impl std::fmt::Display) -> String {
-    format!(
-        "MediaMTX could not start: {error}. Ensure the target-specific 'mediamtx' sidecar is present in src-tauri/binaries and that mediamtx.yml is bundled."
-    )
-}
-
-fn wait_for_mediamtx_listener(open: bool, timeout: Duration) -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], 8889));
-    let deadline = Instant::now() + timeout;
-    loop {
-        let is_open = TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok();
-        if is_open == open {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn start_mediamtx(app: &AppHandle) -> Result<MediaMtxStatus, String> {
-    let config_path = app
-        .path()
-        .resolve("mediamtx.yml", BaseDirectory::Resource)
-        .map_err(mediamtx_failure)?;
-
-    if !config_path.is_file() {
-        return Err(mediamtx_failure(format!(
-            "configuration resource '{}' was not found",
-            config_path.display()
-        )));
-    }
-
-    if wait_for_mediamtx_listener(true, Duration::from_millis(1)) {
-        return Err(mediamtx_failure(
-            "WHEP port 8889 is already in use; close the other relay or application instance",
-        ));
-    }
-
-    let command = app
-        .shell()
-        .sidecar("mediamtx")
-        .map_err(mediamtx_failure)?
-        .args([config_path.to_string_lossy().into_owned()]);
-    let (mut events, child) = command.spawn().map_err(mediamtx_failure)?;
-    let pid = child.pid();
-
-    if !wait_for_mediamtx_listener(true, Duration::from_secs(3)) {
-        let _ = child.kill();
-        return Err(mediamtx_failure(
-            "the WHEP listener at 127.0.0.1:8889 did not become ready within 3 seconds",
-        ));
-    }
-
-    let generation = {
-        let state = app.state::<MediaMtxState>();
-        let mut lifecycle = state
-            .0
-            .lock()
-            .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
-        let generation = lifecycle.generation;
-        lifecycle.child = Some(child);
-        lifecycle.status = MediaMtxStatus {
-            running: true,
-            state: "running".to_string(),
-            pid: Some(pid),
-            detail: format!(
-                "MediaMTX is running (PID {pid}); SRT ingest and WHEP playback are available on loopback."
-            ),
-            last_error: None,
-        };
-        generation
-    };
-
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = events.recv().await {
-            let state = handle.state::<MediaMtxState>();
-            let Ok(mut lifecycle) = state.0.lock() else {
-                break;
-            };
-            if lifecycle.generation != generation {
-                break;
-            }
-
-            match event {
-                CommandEvent::Error(error) => {
-                    let error = format!("MediaMTX process communication failed: {error}");
-                    lifecycle.status.state = "error".to_string();
-                    lifecycle.status.detail = error.clone();
-                    lifecycle.status.last_error = Some(error);
-                }
-                CommandEvent::Terminated(payload) => {
-                    lifecycle.child = None;
-                    lifecycle.status.running = false;
-                    lifecycle.status.pid = None;
-                    let detail = format!(
-                        "MediaMTX exited unexpectedly (code {:?}, signal {:?}). Use restartMediaMtx() to retry.",
-                        payload.code, payload.signal
-                    );
-                    lifecycle.status.state = "error".to_string();
-                    lifecycle.status.detail = detail.clone();
-                    lifecycle.status.last_error = Some(detail);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    get_mediamtx_status(app.state())
-}
-
-fn record_mediamtx_start_failure(app: &AppHandle, error: String) {
-    let state = app.state::<MediaMtxState>();
-    if let Ok(mut lifecycle) = state.0.lock() {
-        lifecycle.child = None;
-        lifecycle.status = MediaMtxStatus {
-            running: false,
-            state: "error".to_string(),
-            pid: None,
-            detail: error.clone(),
-            last_error: Some(error),
-        };
-    };
-}
-
-fn stop_mediamtx(state: tauri::State<'_, MediaMtxState>) -> Result<(), String> {
-    let child = {
-        let mut lifecycle = state
-            .0
-            .lock()
-            .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
-        lifecycle.status.running = false;
-        lifecycle.status.state = "stopping".to_string();
-        lifecycle.status.detail = "Stopping MediaMTX…".to_string();
-        lifecycle.child.take()
-    };
-
-    if let Some(child) = child {
-        child
-            .kill()
-            .map_err(|e| format!("Failed to stop MediaMTX process: {e}"))?;
-        if !wait_for_mediamtx_listener(false, Duration::from_secs(3)) {
-            return Err(
-                "MediaMTX was stopped, but its WHEP port 8889 did not become available within 3 seconds. Another process may be using the port."
-                    .to_string(),
-            );
-        }
-    }
-
-    let mut lifecycle = state
-        .0
-        .lock()
-        .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())?;
-    lifecycle.status = MediaMtxStatus {
-        detail: "MediaMTX is stopped.".to_string(),
-        ..MediaMtxStatus::default()
-    };
-    Ok(())
-}
-
-#[tauri::command]
-fn get_mediamtx_status(state: tauri::State<'_, MediaMtxState>) -> Result<MediaMtxStatus, String> {
-    state
-        .0
-        .lock()
-        .map(|lifecycle| lifecycle.status.clone())
-        .map_err(|_| "MediaMTX lifecycle state is unavailable.".to_string())
-}
-
-#[tauri::command]
-fn restart_mediamtx(app: AppHandle) -> Result<MediaMtxStatus, String> {
-    stop_mediamtx(app.state())?;
-    match start_mediamtx(&app) {
-        Ok(status) => Ok(status),
-        Err(error) => {
-            record_mediamtx_start_failure(&app, error.clone());
-            Err(error)
-        }
-    }
 }
 
 // start.gg sends timestamps as epoch-second integers, but has been seen to
@@ -2880,6 +2654,42 @@ fn write_stream_overlay(request: WriteOverlayRequest) -> Result<(), String> {
         .map_err(|e| format!("Failed to write overlay file '{}': {e}", path.display()))
 }
 
+// The overlay layout lives wherever the user keeps it, so its directory can't
+// be in tauri.conf.json's static asset scope. OBS's browser source can point
+// straight at file:///, but an iframe inside the webview can't - it has to go
+// through the asset protocol, and the asset protocol only serves paths the
+// scope allows. Granting the layout's own directory (recursively, so its CSS,
+// JS, images and the program_state.json it polls all resolve) is the narrowest
+// grant that still makes the real layout render.
+#[tauri::command]
+fn allow_overlay_layout_path(app: AppHandle, path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Overlay layout path is empty.".to_string());
+    }
+
+    let layout = Path::new(trimmed);
+    if !layout.is_file() {
+        return Err(format!(
+            "Overlay layout '{}' is not a file. Point this at the same index.html the OBS browser source uses.",
+            layout.display()
+        ));
+    }
+
+    let canonical = layout
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve overlay layout '{}': {e}", layout.display()))?;
+    let directory = canonical
+        .parent()
+        .ok_or_else(|| "Overlay layout has no containing directory.".to_string())?;
+
+    app.asset_protocol_scope()
+        .allow_directory(directory, true)
+        .map_err(|e| format!("Could not grant access to '{}': {e}", directory.display()))?;
+
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn get_platform() -> &'static str {
     std::env::consts::OS
@@ -2942,6 +2752,36 @@ fn disable_gstreamer_pipewire_plugin() {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// Chromium (and therefore WebView2) enumerates cameras through the Windows
+// Camera Frame Server by default. That frame server is a system service
+// running as LOCAL SERVICE, so it only ever sees machine-wide DirectShow
+// registrations under HKLM - it cannot see a virtual camera filter that an
+// unprivileged tournament account registered for itself under HKCU. Turning
+// the Media Foundation capture path off puts DirectShow enumeration back
+// in-process, under the logged-in user's registry hive, which is what makes
+// the per-user OBS Virtual Camera registration visible to the preview panel.
+//
+// Must be set before the webview is created, i.e. before Tauri builds the app.
+// See scripts/register-obs-virtualcam-peruser.ps1 and
+// docs/no-admin-obs-virtual-camera.md.
+#[cfg(target_os = "windows")]
+fn prefer_directshow_camera_enumeration() {
+    const FLAG: &str = "--disable-features=MediaFoundationVideoCapture";
+    const VAR: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+
+    let existing = std::env::var(VAR).unwrap_or_default();
+    if existing.contains(FLAG) {
+        return;
+    }
+
+    let combined = if existing.trim().is_empty() {
+        FLAG.to_string()
+    } else {
+        format!("{existing} {FLAG}")
+    };
+    std::env::set_var(VAR, combined);
+}
+
 pub fn run() {
     #[cfg(any(
         target_os = "linux",
@@ -2952,10 +2792,11 @@ pub fn run() {
     ))]
     disable_gstreamer_pipewire_plugin();
 
+    #[cfg(target_os = "windows")]
+    prefer_directshow_camera_enumeration();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
-        .manage(MediaMtxState::default())
         .setup(|_app| {
             // WebKitGTK (Tauri's Linux webview) denies getUserMedia by default
             // unless the host app answers its "permission-request" signal itself;
@@ -2988,10 +2829,6 @@ pub fn run() {
                 }
             }
 
-            if let Err(error) = start_mediamtx(_app.handle()) {
-                record_mediamtx_start_failure(_app.handle(), error);
-            }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3007,17 +2844,12 @@ pub fn run() {
             save_local_results,
             write_stream_overlay,
             get_platform,
-            get_mediamtx_status,
-            restart_mediamtx,
+            allow_overlay_layout_path,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            let _ = stop_mediamtx(app_handle.state());
-        }
-    });
+    app.run(|_app_handle, _event| {});
 }
 
 #[cfg(test)]
@@ -3193,12 +3025,13 @@ mod tests {
         let config: AppConfig = serde_json::from_str(legacy).expect("legacy config should parse");
         assert_eq!(config.per_page, 128);
         assert!(config.auto_write_overlay);
-        assert_eq!(config.preview_source_mode, DEFAULT_PREVIEW_SOURCE_MODE);
-        assert_eq!(config.preview_whep_url, DEFAULT_PREVIEW_WHEP_URL);
     }
 
     #[test]
-    fn preview_settings_round_trip_when_present() {
+    fn a_config_from_the_webrtc_preview_builds_still_loads() {
+        // The local MediaMTX/WHEP preview relay was removed; a config written
+        // while it existed must still load, and must not leave its settings
+        // behind when this version saves the config again.
         let raw = r#"{
             "apiToken": "t",
             "tournamentSlug": "tournament/x/event/y",
@@ -3210,12 +3043,43 @@ mod tests {
             "previewWhepUrl": "http://127.0.0.1:7777/custom/whep"
         }"#;
 
-        let config: AppConfig = serde_json::from_str(raw).expect("current config should parse");
+        let config: AppConfig = serde_json::from_str(raw).expect("config should parse");
+        assert_eq!(config.per_page, 64);
+        // previewSourceMode survives as a key name but no longer has a
+        // "webrtc" variant, so it must fall back to the default rather than
+        // carrying a mode nothing implements any more.
+        assert_eq!(config.preview_source_mode, "webrtc");
         let serialized = serde_json::to_value(config).expect("config should serialize");
-        assert_eq!(serialized["previewSourceMode"], json!("webrtc"));
+        assert!(serialized.get("previewWhepUrl").is_none());
+    }
+
+    #[test]
+    fn preview_settings_default_to_auto_detection() {
+        let config = AppConfig::default();
+        assert_eq!(config.preview_source_mode, DEFAULT_PREVIEW_SOURCE_MODE);
+        assert_eq!(config.preview_source_mode, "auto");
+        assert!(config.overlay_layout_url.is_empty());
+    }
+
+    #[test]
+    fn preview_settings_round_trip() {
+        let raw = r#"{
+            "apiToken": "t",
+            "tournamentSlug": "tournament/x/event/y",
+            "streamOutputPath": "/tmp/state.json",
+            "preferredCameraId": null,
+            "perPage": 128,
+            "autoWriteOverlay": true,
+            "previewSourceMode": "overlay",
+            "overlayLayoutUrl": "C:\\overlays\\index.html"
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(raw).expect("config should parse");
+        let serialized = serde_json::to_value(config).expect("config should serialize");
+        assert_eq!(serialized["previewSourceMode"], json!("overlay"));
         assert_eq!(
-            serialized["previewWhepUrl"],
-            json!("http://127.0.0.1:7777/custom/whep")
+            serialized["overlayLayoutUrl"],
+            json!("C:\\overlays\\index.html")
         );
     }
 
