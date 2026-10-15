@@ -136,15 +136,19 @@ describe("SetEditor reset/edit of a reported result", () => {
     expect(wrapper.text()).toContain("Confirm reset?");
 
     await buttonWithText(wrapper, "Confirm reset?").trigger("click");
-    expect(wrapper.emitted("reset-result")[0]).toEqual([{ keepScores: false }]);
+    expect(wrapper.emitted("reset-result")).toHaveLength(1);
   });
 
-  it("keeps the existing scores when editing rather than resetting", async () => {
+  it("lets a reported set be resubmitted directly, without resetting it first", async () => {
     const wrapper = mountEditor({ setData: setData({ games: [1, 1, null], completed: true }) });
 
-    await buttonWithText(wrapper, "Edit result").trigger("click");
-    await buttonWithText(wrapper, "Confirm edit?").trigger("click");
-    expect(wrapper.emitted("reset-result")[0]).toEqual([{ keepScores: true }]);
+    expect(buttonWithText(wrapper, "Edit result")).toBeUndefined();
+    const resubmit = buttonWithText(wrapper, "Resubmit to start.gg");
+    expect(resubmit.attributes("disabled")).toBeUndefined();
+
+    await resubmit.trigger("click");
+    expect(wrapper.emitted("submit")).toHaveLength(1);
+    expect(wrapper.emitted("reset-result")).toBeUndefined();
   });
 
   it("drops a pending confirmation when a different set is loaded", async () => {
@@ -242,5 +246,42 @@ describe("SetEditor timer and local-result reminder", () => {
     const wrapper = mountEditor({ draft: { savedAt: Date.now() - 20 * 60_000 } });
     expect(wrapper.find(".notice-draft").text()).toContain("Saved locally 20 minutes ago");
     expect(wrapper.find(".notice-draft").text()).toContain("remember to submit to start.gg");
+  });
+});
+
+describe("SetEditor formats and score swapping", () => {
+  it("offers the configured best-of options, plus the set's own format", () => {
+    const wrapper = mountEditor({
+      bestOfOptions: [3, 5, 7],
+      setData: setData({ bestOf: 9, games: Array(9).fill(null) }),
+    });
+
+    const options = wrapper.find("select").findAll("option").map((node) => Number(node.element.value));
+    expect(options).toEqual([3, 5, 7, 9]);
+    expect(wrapper.findAll(".game-row")).toHaveLength(9);
+  });
+
+  it("renders a best of 7 with seven games, decided at four wins", () => {
+    const wrapper = mountEditor({
+      bestOfOptions: [3, 5, 7],
+      setData: setData({ bestOf: 7, games: [1, 1, 1, null, null, null, null] }),
+    });
+
+    expect(wrapper.findAll(".game-row")).toHaveLength(7);
+    // 3-0 isn't over in a best of 7.
+    expect(buttonWithText(wrapper, "Submit to start.gg").attributes("disabled")).toBeDefined();
+    expect(wrapper.findAll(".game-row")[3].classes()).not.toContain("locked");
+  });
+
+  it("always offers swapping scores, but swapping players only when allowed", async () => {
+    const quick = mountEditor();
+    expect(buttonWithText(quick, "Swap Scores")).toBeDefined();
+    expect(buttonWithText(quick, "Swap Players")).toBeUndefined();
+
+    await buttonWithText(quick, "Swap Scores").trigger("click");
+    expect(quick.emitted("swap-scores")).toHaveLength(1);
+
+    const stream = mountEditor({ allowSwap: true });
+    expect(buttonWithText(stream, "Swap Players")).toBeDefined();
   });
 });

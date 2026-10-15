@@ -18,6 +18,8 @@ const BASE_CONFIG = {
   preferredCameraId: "",
   perPage: 128,
   autoWriteOverlay: true,
+  // The fixtures below are best-of-3 sets.
+  bracketBestOf: 3,
 };
 
 function openSet(overrides = {}) {
@@ -74,6 +76,7 @@ beforeEach(() => {
     // seconds (null = it didn't tell us one).
     serverStartedAt: null,
     markSetInProgressFails: false,
+    updateSetFails: false,
   };
 
   invokeMock.mockReset();
@@ -99,6 +102,11 @@ beforeEach(() => {
         return { success: true, message: "ok" };
       case "reset_set_result":
         return { success: true, message: "reset" };
+      case "update_set_result":
+        if (backend.updateSetFails) {
+          throw new Error("start.gg rejected the update");
+        }
+        return { success: true, message: "updated" };
       case "mark_set_in_progress":
         if (backend.markSetInProgressFails) {
           throw new Error("start.gg rejected the start");
@@ -298,22 +306,6 @@ describe("App editing and resetting reported results", () => {
     expect(wrapper.find(".modal-card").findAll(".score").map((n) => n.text())).toEqual(["0", "0"]);
   });
 
-  it("keeps the existing scores when editing a reported result", async () => {
-    const wrapper = await mountApp();
-    const modal = await openQuickReport(wrapper, 1);
-
-    await findButton(modal, "Edit result").trigger("click");
-    await findButton(modal, "Confirm edit?").trigger("click");
-    await flushPromises();
-
-    expect(callsTo("reset_set_result")).toHaveLength(1);
-    const card = wrapper.find(".modal-card");
-    expect(card.findAll(".score").map((node) => node.text())).toEqual(["2", "0"]);
-    // The reset reopened it, so the corrected result can be submitted again.
-    expect(card.text()).not.toContain("Already reported on start.gg");
-    expect(findButton(card, "Submit to start.gg").attributes("disabled")).toBeUndefined();
-  });
-
   it("keeps the set reopened even if start.gg still serves the cached result", async () => {
     const wrapper = await mountApp();
     const modal = await openQuickReport(wrapper, 1);
@@ -326,29 +318,230 @@ describe("App editing and resetting reported results", () => {
     // caches for ~60s) - the editor must still show it as reopened.
     expect(wrapper.find(".modal-card").text()).not.toContain("Already reported on start.gg");
   });
+});
 
-  it("re-reports a corrected result after an edit", async () => {
+describe("App resubmitting a reported result", () => {
+  it("corrects a reported set in place, without resetting it", async () => {
     const wrapper = await mountApp();
     const modal = await openQuickReport(wrapper, 1);
 
-    await findButton(modal, "Edit result").trigger("click");
-    await findButton(modal, "Confirm edit?").trigger("click");
+    // 2-0 becomes 2-1: undo game 2, give it to Bob, then Alice takes game 3.
+    await modal.findAll(".win-btn")[2].trigger("click");
+    await modal.findAll(".win-btn")[3].trigger("click");
+    await modal.findAll(".win-btn")[4].trigger("click");
+    await findButton(modal, "Resubmit to start.gg").trigger("click");
     await flushPromises();
 
-    // Undo game 2 and give it to Bob instead - 1-1 isn't a finished set, so
-    // it can't be submitted until a decider is scored.
-    const reopened = wrapper.find(".modal-card");
-    await reopened.findAll(".win-btn")[2].trigger("click");
-    await reopened.findAll(".win-btn")[3].trigger("click");
-    expect(findButton(reopened, "Submit to start.gg").attributes("disabled")).toBeDefined();
+    expect(callsTo("reset_set_result")).toHaveLength(0);
+    expect(callsTo("report_set_result")).toHaveLength(0);
+    const request = lastCallTo("update_set_result").request;
+    expect(request).toMatchObject({ setId: "202", winnerId: 1, isDq: false });
+    expect(request.gameData.map((game) => game.winnerId)).toEqual([1, 2, 1]);
+    expect(wrapper.text()).toContain("Updated set 202 on start.gg.");
+  });
 
-    await reopened.findAll(".win-btn")[5].trigger("click");
-    await findButton(reopened, "Submit to start.gg").trigger("click");
+  it("flips the winner with Swap Scores", async () => {
+    const wrapper = await mountApp();
+    const modal = await openQuickReport(wrapper, 1);
+
+    await findButton(modal, "Swap Scores").trigger("click");
+    expect(modal.findAll(".score").map((node) => node.text())).toEqual(["0", "2"]);
+
+    await findButton(modal, "Resubmit to start.gg").trigger("click");
     await flushPromises();
 
-    const request = lastCallTo("report_set_result").request;
-    expect(request).toMatchObject({ setId: "202", winnerId: 2, isDq: false });
-    expect(request.gameData.map((game) => game.winnerId)).toEqual([1, 2, 2]);
+    expect(lastCallTo("update_set_result").request).toMatchObject({ setId: "202", winnerId: 2 });
+  });
+
+  it("shows the corrected result on the bracket while start.gg still serves the old one", async () => {
+    const wrapper = await mountApp();
+    const modal = await openQuickReport(wrapper, 1);
+
+    await findButton(modal, "Swap Scores").trigger("click");
+    await findButton(modal, "Resubmit to start.gg").trigger("click");
+    await flushPromises();
+
+    // The mock backend still returns the original 2-0.
+    expect(card(wrapper, 1).findAll(".slot-score").map((node) => node.text())).toEqual(["0", "2"]);
+  });
+
+  it("falls back to resetting and re-reporting if start.gg won't update the set", async () => {
+    backend.updateSetFails = true;
+    const wrapper = await mountApp();
+    const modal = await openQuickReport(wrapper, 1);
+
+    await findButton(modal, "Swap Scores").trigger("click");
+    await findButton(modal, "Resubmit to start.gg").trigger("click");
+    await flushPromises();
+
+    expect(callsTo("update_set_result")).toHaveLength(1);
+    expect(lastCallTo("reset_set_result").request).toMatchObject({
+      setId: "202",
+      resetDependentSets: false,
+    });
+    expect(lastCallTo("report_set_result").request).toMatchObject({ setId: "202", winnerId: 2 });
+    expect(wrapper.find(".modal-card").exists()).toBe(false);
+  });
+});
+
+describe("App keeping the stream set and the bracket in sync", () => {
+  async function putOnStream(wrapper, index = 0) {
+    await card(wrapper, index).trigger("contextmenu");
+    await flushPromises();
+    return () => wrapper.find(".top-grid .set-editor");
+  }
+
+  it("shows the stream set's unsubmitted score on its bracket card", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+
+    await editor().findAll(".win-btn")[0].trigger("click");
+
+    expect(card(wrapper).findAll(".slot-score").map((node) => node.text())).toEqual(["1", "0"]);
+  });
+
+  it("lines the live score up with the bracket when players are swapped on stream", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+
+    await findButton(editor(), "Swap Players").trigger("click");
+    // Alice is now on the right - she takes game 1.
+    await editor().findAll(".win-btn")[1].trigger("click");
+
+    expect(card(wrapper).findAll(".slot-score").map((node) => node.text())).toEqual(["1", "0"]);
+  });
+
+  it("keeps a swap through a refresh, with the scores staying with their players", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+
+    await findButton(editor(), "Swap Players").trigger("click");
+    await editor().findAll(".win-btn")[1].trigger("click");
+
+    await findButton(wrapper, "Refresh Tournament").trigger("click");
+    await flushPromises();
+
+    const names = editor().findAll(".player-box input").map((input) => input.element.value);
+    expect(names).toEqual(["Bob", "Alice"]);
+    expect(editor().findAll(".score").map((node) => node.text())).toEqual(["0", "1"]);
+  });
+
+  it("keeps a swap when another set is reported (which refreshes the bracket)", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+
+    await findButton(editor(), "Swap Players").trigger("click");
+    await editor().findAll(".win-btn")[1].trigger("click");
+
+    // Correct the other set, which refetches the whole tournament.
+    const modal = await openQuickReport(wrapper, 1);
+    await findButton(modal, "Swap Scores").trigger("click");
+    await findButton(modal, "Resubmit to start.gg").trigger("click");
+    await flushPromises();
+
+    const names = editor().findAll(".player-box input").map((input) => input.element.value);
+    expect(names).toEqual(["Bob", "Alice"]);
+    expect(editor().findAll(".score").map((node) => node.text())).toEqual(["0", "1"]);
+  });
+
+  it("keeps a format changed on stream through a refresh", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+
+    await editor().find("select").setValue("5");
+    await findButton(wrapper, "Refresh Tournament").trigger("click");
+    await flushPromises();
+
+    expect(editor().findAll(".game-row")).toHaveLength(5);
+  });
+
+  it("opens the on-stream set's own score in quick report, and mirrors changes back", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+    await editor().findAll(".win-btn")[0].trigger("click");
+
+    const modal = await openQuickReport(wrapper);
+    expect(modal.findAll(".score").map((node) => node.text())).toEqual(["1", "0"]);
+
+    await modal.findAll(".win-btn")[2].trigger("click");
+    expect(editor().findAll(".score").map((node) => node.text())).toEqual(["2", "0"]);
+  });
+
+  it("marks the stream set reported once the quick report submits it", async () => {
+    const wrapper = await mountApp();
+    const editor = await putOnStream(wrapper);
+    await editor().findAll(".win-btn")[0].trigger("click");
+
+    const modal = await openQuickReport(wrapper);
+    await modal.findAll(".win-btn")[2].trigger("click");
+    await findButton(modal, "Submit to start.gg").trigger("click");
+    await flushPromises();
+
+    // start.gg's cached copy still says unreported, but the editor and the
+    // bracket both know better.
+    expect(editor().text()).toContain("Already reported on start.gg");
+    expect(card(wrapper).findAll(".slot-score").map((node) => node.text())).toEqual(["2", "0"]);
+    expect(card(wrapper).findAll(".slot-row")[0].classes()).toContain("winner");
+  });
+});
+
+describe("App quick timer on the bracket view", () => {
+  it("starts a set from its card without opening it", async () => {
+    const wrapper = await mountApp();
+
+    await card(wrapper).element.parentElement.querySelector(".card-timer-btn").click();
+    await flushPromises();
+
+    expect(lastCallTo("mark_set_in_progress").request).toMatchObject({ setId: "101" });
+    expect(wrapper.find(".modal-card").exists()).toBe(false);
+    expect(card(wrapper).find(".match-timer").exists()).toBe(true);
+  });
+});
+
+describe("App best-of and pool view settings", () => {
+  it("opens sets with the configured default and offers custom formats", async () => {
+    backend.config = { ...BASE_CONFIG, bracketBestOf: 7, bestOfOptions: [3, 5, 7] };
+    const wrapper = await mountApp();
+
+    await card(wrapper).trigger("contextmenu");
+    await flushPromises();
+
+    const editor = wrapper.find(".top-grid .set-editor");
+    expect(editor.findAll(".game-row")).toHaveLength(7);
+    expect(editor.find("select").findAll("option").map((o) => o.text())).toContain("Best of 7");
+    expect(lastCallTo("write_stream_overlay").request.bestOf).toBe(7);
+  });
+
+  it("still opens a reported set in the format its score shows", async () => {
+    backend.config = { ...BASE_CONFIG, bracketBestOf: 7, bestOfOptions: [3, 5, 7] };
+    const wrapper = await mountApp();
+
+    const modal = await openQuickReport(wrapper, 1);
+    // 2-0 can only have been a best of 3.
+    expect(modal.findAll(".game-row")).toHaveLength(3);
+  });
+
+  it("saves the new settings", async () => {
+    const wrapper = await mountApp();
+
+    await findButton(wrapper, "Show settings").trigger("click");
+    const selects = wrapper.find(".config-grid").findAll("select");
+    await selects[1].setValue("list");
+    const optionsInput = wrapper
+      .find(".config-grid")
+      .findAll("input")
+      .find((input) => input.attributes("placeholder") === "3, 5, 7");
+    await optionsInput.setValue("7, 3, 5");
+    await optionsInput.trigger("change");
+    await selects[2].setValue("5");
+    await findButton(wrapper, "Save Settings").trigger("click");
+    await flushPromises();
+
+    expect(backend.config).toMatchObject({
+      poolViewMode: "list",
+      poolBestOf: 5,
+      bestOfOptions: [3, 5, 7],
+    });
   });
 });
 

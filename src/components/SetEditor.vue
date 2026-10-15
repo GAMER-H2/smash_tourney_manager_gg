@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref, watch } from "vue";
 import CharacterPicker from "./CharacterPicker.vue";
-import { canReportGame, isDq, isSubmittable, scoreFor } from "../lib/set-utils";
+import { canReportGame, isDq, isSubmittable, normalizeBestOf, scoreFor } from "../lib/set-utils";
 import { describeDraftAge } from "../lib/drafts";
 
 const props = defineProps({
@@ -57,6 +57,11 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  // Best-of formats to offer, from settings.
+  bestOfOptions: {
+    type: Array,
+    default: () => [3, 5],
+  },
 });
 
 const emit = defineEmits([
@@ -67,6 +72,7 @@ const emit = defineEmits([
   "toggle-game-winner",
   "toggle-dq",
   "swap-players",
+  "swap-scores",
   "apply-overlay",
   "submit",
   "reset-result",
@@ -74,7 +80,16 @@ const emit = defineEmits([
   "reset-timer",
 ]);
 
-const gameCount = computed(() => (props.setData?.bestOf === 3 ? 3 : 5));
+const gameCount = computed(() => normalizeBestOf(props.setData?.bestOf));
+
+// The configured formats, plus whatever this set is already using (e.g. a
+// best of 7 reported before the option was removed from settings) so the
+// select never shows a blank.
+const formatOptions = computed(() => {
+  const options = new Set(props.bestOfOptions);
+  if (props.setData?.bestOf) options.add(props.setData.bestOf);
+  return [...options].sort((a, b) => a - b);
+});
 
 const p1Wins = computed(() => scoreFor(props.setData, 1));
 const p2Wins = computed(() => scoreFor(props.setData, 2));
@@ -123,7 +138,7 @@ const timerNote = computed(() => {
 
 // Resetting a set on start.gg undoes a result the TO already reported, so it
 // takes a deliberate second click rather than firing straight off one.
-const pendingReset = ref(null);
+const pendingReset = ref(false);
 
 // Same for resetting a timer that started the set on start.gg: that un-starts
 // it there, which anyone watching the bracket sees. A purely local timer
@@ -133,7 +148,7 @@ const pendingTimerReset = ref(false);
 watch(
   () => props.setData?.setId,
   () => {
-    pendingReset.value = null;
+    pendingReset.value = false;
     pendingTimerReset.value = false;
   },
 );
@@ -147,14 +162,19 @@ function requestTimerReset() {
   pendingTimerReset.value = true;
 }
 
-function requestReset(mode) {
-  if (pendingReset.value === mode) {
-    pendingReset.value = null;
-    emit("reset-result", { keepScores: mode === "edit" });
+function requestReset() {
+  if (pendingReset.value) {
+    pendingReset.value = false;
+    emit("reset-result");
     return;
   }
-  pendingReset.value = mode;
+  pendingReset.value = true;
 }
+
+const submitLabel = computed(() => {
+  if (props.submitting) return props.setData?.completed ? "Resubmitting…" : "Submitting…";
+  return props.setData?.completed ? "Resubmit to start.gg" : "Submit to start.gg";
+});
 
 function reportLocked(index) {
   return !props.setData?.games[index]?.winner && !canReportGame(props.setData, index);
@@ -179,7 +199,7 @@ function reportLocked(index) {
     <div v-else class="editor-content">
       <p v-if="draftNotice" class="notice notice-draft">{{ draftNotice }}</p>
       <p v-if="setData.completed" class="notice notice-reported">
-        Already reported on start.gg - reset it to report a different result.
+        Already reported on start.gg - change the score and resubmit to correct it.
       </p>
 
       <div v-if="timer" class="timer-block">
@@ -212,18 +232,29 @@ function reportLocked(index) {
           :value="setData.bestOf"
           @change="emit('set-best-of', Number($event.target.value))"
         >
-          <option :value="3">Best of 3</option>
-          <option :value="5">Best of 5</option>
+          <option v-for="option in formatOptions" :key="option" :value="option">
+            Best of {{ option }}
+          </option>
         </select>
-        <button
-          v-if="allowSwap"
-          type="button"
-          class="swap-btn"
-          title="Swap players"
-          @click="emit('swap-players')"
-        >
-          ⇄ Swap Players
-        </button>
+        <span class="swap-group">
+          <button
+            type="button"
+            class="swap-btn"
+            title="Give each game (and any DQ) to the other player, keeping names and characters in place"
+            @click="emit('swap-scores')"
+          >
+            ⇅ Swap Scores
+          </button>
+          <button
+            v-if="allowSwap"
+            type="button"
+            class="swap-btn"
+            title="Swap which side each player is on - their scores and characters move with them"
+            @click="emit('swap-players')"
+          >
+            ⇄ Swap Players
+          </button>
+        </span>
       </div>
 
       <div class="player-grid">
@@ -316,18 +347,10 @@ function reportLocked(index) {
           type="button"
           class="reset-btn"
           :disabled="resetting"
-          @click="requestReset('edit')"
+          title="Un-report this set on start.gg and clear its score"
+          @click="requestReset"
         >
-          {{ pendingReset === "edit" ? "Confirm edit?" : "Edit result" }}
-        </button>
-        <button
-          v-if="setData.completed"
-          type="button"
-          class="reset-btn"
-          :disabled="resetting"
-          @click="requestReset('clear')"
-        >
-          {{ pendingReset === "clear" ? "Confirm reset?" : "Reset result" }}
+          {{ pendingReset ? "Confirm reset?" : "Reset result" }}
         </button>
         <span class="action-spacer"></span>
         <button
@@ -345,7 +368,7 @@ function reportLocked(index) {
           :title="canSubmit ? '' : 'Report a winner or a DQ first'"
           @click="emit('submit')"
         >
-          {{ submitting ? "Submitting…" : "Submit to start.gg" }}
+          {{ submitLabel }}
         </button>
       </div>
     </div>
@@ -465,8 +488,13 @@ function reportLocked(index) {
   gap: 8px;
 }
 
-.swap-btn {
+.swap-group {
   margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.swap-btn {
   font-size: 12px;
 }
 

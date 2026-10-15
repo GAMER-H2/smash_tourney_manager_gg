@@ -8,6 +8,65 @@ export function emptyGame() {
 // overlay what to display.
 export const DQ_SCORE = -1;
 
+// Best-of formats are always odd (a set needs a majority of its games) and
+// capped well past anything a bracket actually runs.
+export const DEFAULT_BEST_OF_OPTIONS = [3, 5];
+export const DEFAULT_POOL_BEST_OF = 3;
+export const DEFAULT_BRACKET_BEST_OF = 5;
+const MAX_BEST_OF = 15;
+
+export function normalizeBestOf(value, fallback = DEFAULT_BRACKET_BEST_OF) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n) || n < 1 || n > MAX_BEST_OF || n % 2 === 0) return fallback;
+  return n;
+}
+
+// The best-of choices offered in the editors and settings. Accepts either an
+// array or the comma-separated text the settings field holds, and drops
+// anything that isn't a usable format rather than failing on it.
+export function normalizeBestOfOptions(raw) {
+  const parts = Array.isArray(raw) ? raw : String(raw ?? "").split(/[\s,]+/);
+  const valid = parts.map((part) => normalizeBestOf(part, null)).filter(Boolean);
+  const unique = [...new Set(valid)].sort((a, b) => a - b);
+  return unique.length ? unique : [...DEFAULT_BEST_OF_OPTIONS];
+}
+
+// Games needed to take a set: 2 of a best of 3, 3 of a best of 5, ...
+export function targetWinsFor(bestOf) {
+  return Math.floor(normalizeBestOf(bestOf) / 2) + 1;
+}
+
+// Round-robin pool sets carry no bracket round, and start.gg's own phase
+// naming convention for them is "Pools"/"Groups" - the same two signals
+// bracket-utils uses to decide a whole bucket is a pool.
+export function isPoolSet(set) {
+  const phaseName = String(set?.phaseName || "").toLowerCase();
+  return Number(set?.round) === 0 || phaseName.includes("pool") || phaseName.includes("group");
+}
+
+// The format to open a fetched set with. A completed set's real score is
+// the best evidence there is (whoever won reached the target, so a 2-1 was a
+// best of 3 and a 4-2 a best of 7); otherwise it's the TO's configured
+// default for pools or bracket. Without defaults (older callers, tests) the
+// set's own bestOf is used as-is.
+export function resolveBestOf(set, defaults) {
+  if (!defaults) return normalizeBestOf(set?.bestOf);
+
+  const p1 = Number(set?.player1?.score);
+  const p2 = Number(set?.player2?.score);
+  const reported = Number(set?.state) === 3 || Boolean(set?.winnerId);
+  const isDqResult = p1 === DQ_SCORE || p2 === DQ_SCORE;
+  const maxScore = Math.max(Number.isFinite(p1) ? p1 : 0, Number.isFinite(p2) ? p2 : 0);
+
+  if (reported && !isDqResult && maxScore >= 2) {
+    return normalizeBestOf(maxScore * 2 - 1);
+  }
+
+  return isPoolSet(set)
+    ? normalizeBestOf(defaults.poolBestOf, DEFAULT_POOL_BEST_OF)
+    : normalizeBestOf(defaults.bracketBestOf, DEFAULT_BRACKET_BEST_OF);
+}
+
 export function emptyEditorSet() {
   return {
     setId: null,
@@ -51,9 +110,9 @@ export function dqFromTournamentSet(set) {
   return null;
 }
 
-export function createEditorSetFromTournamentSet(set) {
-  const bestOf = set?.bestOf === 3 ? 3 : 5;
-  const targetWins = bestOf === 3 ? 2 : 3;
+export function createEditorSetFromTournamentSet(set, bestOfDefaults = null) {
+  const bestOf = resolveBestOf(set, bestOfDefaults);
+  const targetWins = targetWinsFor(bestOf);
   const p1Score = Math.max(0, Number(set?.player1?.score ?? 0));
   const p2Score = Math.max(0, Number(set?.player2?.score ?? 0));
   const p1EntrantId = set?.player1?.entrantId ?? null;
@@ -121,7 +180,7 @@ export function createEditorSetFromTournamentSet(set) {
 // True once either player has already won enough games to take the set, so
 // no further games need (or should) be reportable - e.g. a 2-0 best of 3.
 function isSetDecided(editorSet) {
-  const targetWins = editorSet?.bestOf === 3 ? 2 : 3;
+  const targetWins = targetWinsFor(editorSet?.bestOf);
   return winsFor(editorSet, 1) >= targetWins || winsFor(editorSet, 2) >= targetWins;
 }
 
@@ -239,4 +298,70 @@ export function clearResults(editorSet, { keepCharacters = true } = {}) {
     player2Character: keepCharacters ? game.player2Character : "",
   }));
   return next;
+}
+
+// Resizes a set to a new format, keeping whatever games it already has and
+// dropping any that no longer fit.
+export function withBestOf(editorSet, bestOf) {
+  const next = cloneEditorSet(editorSet);
+  next.bestOf = normalizeBestOf(bestOf, next.bestOf);
+  next.games = next.games.slice(0, next.bestOf);
+  while (next.games.length < next.bestOf) next.games.push(emptyGame());
+  return next;
+}
+
+function flipSide(value) {
+  if (value === 1) return 2;
+  if (value === 2) return 1;
+  return value;
+}
+
+// Swaps which side each game (and any DQ) was won/given on, leaving players
+// and character picks where they are - for when the scores went in against
+// the wrong player.
+export function swapScores(editorSet) {
+  const next = cloneEditorSet(editorSet);
+  next.dq = flipSide(next.dq);
+  next.games = next.games.map((game) => ({ ...game, winner: flipSide(game.winner) }));
+  return next;
+}
+
+// Swaps the two players' sides entirely - names, entrants, characters, game
+// winners and DQ all move together, so the result itself is unchanged.
+export function swapSides(editorSet) {
+  const next = cloneEditorSet(editorSet);
+  [next.player1, next.player2] = [next.player2, next.player1];
+  next.dq = flipSide(next.dq);
+  next.games = next.games.map((game) => ({
+    winner: flipSide(game.winner),
+    player1Character: game.player2Character,
+    player2Character: game.player1Character,
+  }));
+  return next;
+}
+
+// Whether the editor set has its players the other way round from `set`
+// (a fetched start.gg set, or another editor set) - e.g. because the TO
+// swapped them on stream to match who's sitting on which side.
+export function isSwappedRelativeTo(editorSet, set) {
+  const a1 = editorSet?.player1?.entrantId;
+  const a2 = editorSet?.player2?.entrantId;
+  const b1 = set?.player1?.entrantId;
+  const b2 = set?.player2?.entrantId;
+  if (!a1 && !a2) return false;
+  return (a1 ?? null) === (b2 ?? null) && (a2 ?? null) === (b1 ?? null) && a1 !== a2;
+}
+
+// The same editor set, turned to have its players the same way round as
+// `set`. A copy either way.
+export function orientLike(editorSet, set) {
+  return isSwappedRelativeTo(editorSet, set) ? swapSides(editorSet) : cloneEditorSet(editorSet);
+}
+
+// The score an editor set currently holds, in the slot order of the fetched
+// set it belongs to - so a score typed into a (possibly swapped) editor can
+// be shown on the right rows of that set's bracket card.
+export function slotScoresFor(editorSet, set) {
+  const oriented = orientLike(editorSet, set);
+  return { player1: scoreFor(oriented, 1), player2: scoreFor(oriented, 2) };
 }

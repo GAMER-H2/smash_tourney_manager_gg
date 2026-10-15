@@ -202,3 +202,149 @@ describe("BracketBoard in-progress set timers", () => {
     expect(cell.classes()).toContain("in-progress");
   });
 });
+
+describe("BracketBoard quick timer button", () => {
+  it("starts a playable set's timer without opening it", async () => {
+    const wrapper = mountBoard();
+
+    await wrapper.find(".card-timer-btn").trigger("click");
+
+    expect(wrapper.emitted("toggle-timer")[0][0].id).toBe("w1");
+    // The button sits on the card but mustn't also open the quick report.
+    expect(wrapper.emitted("quick-report")).toBeUndefined();
+  });
+
+  it("shows pause on a running set", () => {
+    const wrapper = mountBoard({
+      setTimers: new Map([["w1", { display: "1:00", running: true }]]),
+    });
+    expect(wrapper.find(".card-timer-btn").text()).toBe("⏸");
+  });
+
+  it("isn't offered on reported sets, sets missing a player, or a locked bucket", () => {
+    const reported = mountBoard({
+      tournamentData: tournamentData([bracketSet({ state: 3, winnerId: 1 })]),
+    });
+    expect(reported.find(".card-timer-btn").exists()).toBe(false);
+
+    const waiting = mountBoard({
+      tournamentData: tournamentData([
+        bracketSet({ player2: { entrantId: null, name: "", placeholder: "Winner of A" } }),
+      ]),
+    });
+    expect(waiting.find(".card-timer-btn").exists()).toBe(false);
+
+    const locked = mountBoard({
+      bucketSyncState: new Map([["b1", { locked: true, attempts: 9, snapshot: { name: "Bracket" } }]]),
+    });
+    expect(locked.find(".card-timer-btn").exists()).toBe(false);
+  });
+
+  it("is on pool grid cells too", async () => {
+    const wrapper = mountBoard({
+      tournamentData: tournamentData([bracketSet({ id: "p1", round: 0, roundText: "" })]),
+    });
+
+    await wrapper.find(".pool-timer-btn").trigger("click");
+    expect(wrapper.emitted("toggle-timer")[0][0].id).toBe("p1");
+    expect(wrapper.emitted("quick-report")).toBeUndefined();
+  });
+});
+
+describe("BracketBoard live (unsubmitted) scores", () => {
+  it("shows an editor's score on a set start.gg has no result for", () => {
+    const wrapper = mountBoard({
+      liveScores: new Map([["w1", { player1: 2, player2: 1 }]]),
+    });
+
+    expect(wrapper.findAll(".slot-score").map((node) => node.text())).toEqual(["2", "1"]);
+    expect(wrapper.find(".slot-score").classes()).toContain("live");
+  });
+
+  it("prefers start.gg's score once the set is reported", () => {
+    const wrapper = mountBoard({
+      tournamentData: tournamentData([
+        bracketSet({
+          state: 3,
+          winnerId: 1,
+          player1: { entrantId: 1, name: "Alice", score: 3 },
+          player2: { entrantId: 2, name: "Bob", score: 0 },
+        }),
+      ]),
+      liveScores: new Map([["w1", { player1: 2, player2: 1 }]]),
+    });
+
+    expect(wrapper.findAll(".slot-score").map((node) => node.text())).toEqual(["3", "0"]);
+  });
+
+  it("shows live scores from each row's point of view in the pool grid", () => {
+    const wrapper = mountBoard({
+      tournamentData: tournamentData([bracketSet({ id: "p1", round: 0, roundText: "" })]),
+      liveScores: new Map([["p1", { player1: 1, player2: 0 }]]),
+    });
+
+    const scores = wrapper
+      .findAll(".pool-cell.live .pool-score")
+      .map((node) => node.text().replace(/\s+/g, " "));
+    expect(scores.sort()).toEqual(["0 - 1", "1 - 0"]);
+  });
+});
+
+describe("BracketBoard pool list view", () => {
+  function poolData() {
+    return tournamentData([
+      bracketSet({ id: "p1", identifier: "A", round: 0, roundText: "" }),
+      bracketSet({
+        id: "p2",
+        identifier: "B",
+        round: 0,
+        roundText: "",
+        player2: { entrantId: 3, name: "Carol", score: 0 },
+      }),
+      bracketSet({
+        id: "p3",
+        identifier: "C",
+        round: 0,
+        roundText: "",
+        state: 3,
+        winnerId: 2,
+        player1: { entrantId: 2, name: "Bob", score: 2 },
+        player2: { entrantId: 3, name: "Carol", score: 0 },
+      }),
+    ]);
+  }
+
+  it("lists just the sets left to play instead of the grid", () => {
+    const wrapper = mountBoard({ tournamentData: poolData(), poolViewMode: "list" });
+
+    expect(wrapper.find(".pool-grid").exists()).toBe(false);
+    expect(wrapper.findAll(".match-card")).toHaveLength(2);
+    expect(wrapper.find(".pool-list-summary").text()).toContain("2 sets left to play");
+  });
+
+  it("puts sets already under way first", () => {
+    const wrapper = mountBoard({
+      tournamentData: poolData(),
+      poolViewMode: "list",
+      setTimers: new Map([["p2", { display: "2:00", running: true }]]),
+    });
+
+    expect(wrapper.findAll(".identifier-badge").map((node) => node.text())).toEqual(["B", "A"]);
+  });
+
+  it("shows completed sets on request, and they still open", async () => {
+    const wrapper = mountBoard({ tournamentData: poolData(), poolViewMode: "list" });
+
+    await wrapper.findAll("button").find((b) => b.text() === "Show completed").trigger("click");
+    const cards = wrapper.findAll(".match-card");
+    expect(cards).toHaveLength(3);
+
+    await cards[2].trigger("click");
+    expect(wrapper.emitted("quick-report")[0][0].id).toBe("p3");
+  });
+
+  it("keeps the grid as the default", () => {
+    const wrapper = mountBoard({ tournamentData: poolData() });
+    expect(wrapper.find(".pool-grid").exists()).toBe(true);
+  });
+});

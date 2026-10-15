@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import MatchCard from "./MatchCard.vue";
 import { buildBracketLayout, buildRoundRobinGrid } from "../lib/bracket-utils";
-import { characterIconLabel, characterIconSrc } from "../lib/characters";
 
 const props = defineProps({
   tournamentData: {
@@ -32,9 +32,27 @@ const props = defineProps({
     type: Object,
     default: () => new Map(),
   },
+  // Map<setId, { player1, player2 }> - scores entered in an editor (the
+  // stream set, or a locally-saved result) that start.gg doesn't have yet,
+  // in each set's own slot order, so the board never disagrees with what's
+  // being played on stream.
+  liveScores: {
+    type: Object,
+    default: () => new Map(),
+  },
+  // "grid" (round-robin table) or "list" (just the sets still to play).
+  poolViewMode: {
+    type: String,
+    default: "grid",
+  },
 });
 
-const emit = defineEmits(["update:activeBucketId", "set-on-stream", "quick-report"]);
+const emit = defineEmits([
+  "update:activeBucketId",
+  "set-on-stream",
+  "quick-report",
+  "toggle-timer",
+]);
 
 const buckets = computed(() => props.tournamentData?.buckets ?? []);
 
@@ -76,6 +94,60 @@ function onSetClick(set, event) {
   emit(event, set);
 }
 
+function liveScore(set) {
+  if (Number(set?.state) === 3) return null;
+  return props.liveScores.get?.(String(set?.id)) ?? null;
+}
+
+// The quick start button is for sets that can actually be played right now:
+// both players known, not already reported, and not in a bucket that's
+// blocked waiting on start.gg.
+function canToggleTimer(set) {
+  if (activeBucketLocked.value) return false;
+  if (Number(set?.state) === 3) return false;
+  return Boolean(set?.player1?.entrantId && set?.player2?.entrantId);
+}
+
+// A pool cell's score from its row player's point of view, preferring an
+// unsubmitted editor score over start.gg's (still empty) one.
+function poolCellScores(row, cell) {
+  const live = liveScore(cell.set);
+  if (!live) return { row: cell.rowScore, col: cell.colScore, live: false };
+  const rowIsPlayer1 = cell.set.player1?.entrantId === row.entrant.id;
+  return {
+    row: rowIsPlayer1 ? live.player1 : live.player2,
+    col: rowIsPlayer1 ? live.player2 : live.player1,
+    live: true,
+  };
+}
+
+function scoreLabel(value) {
+  return Number(value) === -1 ? "DQ" : value;
+}
+
+const isPoolList = computed(() => props.poolViewMode === "list");
+const showCompletedPoolSets = ref(false);
+
+function byIdentifier(a, b) {
+  return (
+    String(a.identifier ?? "").localeCompare(String(b.identifier ?? ""), undefined, { numeric: true }) ||
+    String(a.id).localeCompare(String(b.id), undefined, { numeric: true })
+  );
+}
+
+// The pool list view: every set still to be played (ones already under way
+// first, since those are the ones someone's likely to need next), then - on
+// request - the ones already reported.
+const poolRemainingSets = computed(() =>
+  (activeBucket.value?.sets ?? [])
+    .filter((set) => Number(set.state) !== 3 && set.player1?.entrantId && set.player2?.entrantId)
+    .sort((a, b) => Number(Boolean(setTimer(b))) - Number(Boolean(setTimer(a))) || byIdentifier(a, b)),
+);
+
+const poolCompletedSets = computed(() =>
+  (activeBucket.value?.sets ?? []).filter((set) => Number(set.state) === 3).sort(byIdentifier),
+);
+
 function hasDraft(set) {
   return props.draftedSetIds.has?.(String(set?.id)) ?? false;
 }
@@ -88,31 +160,10 @@ const runningSetCount = computed(
   () => (activeBucket.value?.sets ?? []).filter((set) => setTimer(set)?.running).length,
 );
 
-// start.gg scores a disqualified entrant -1; show that as "DQ" rather than
-// as a negative number nobody would read as a forfeit.
-function slotScore(slot) {
-  return Number(slot?.score) === -1 ? "DQ" : slot?.score;
-}
-
 const draftCount = computed(
   () =>
     (activeBucket.value?.sets ?? []).filter((set) => hasDraft(set)).length,
 );
-
-function isWinnerSlot(set, slot) {
-  return Boolean(set.winnerId && slot?.entrantId && slot.entrantId === set.winnerId);
-}
-
-// Character picks only mean anything once games have actually been played,
-// so only show an icon for a reported (completed) set. Characters with no
-// artwork (Random, or anything we don't recognize) still get a fallback
-// badge rather than silently showing nothing.
-function slotCharacter(set, playerNum) {
-  if (set.state !== 3 || !set.winnerId) return null;
-  const name = playerNum === 1 ? set.player1Character : set.player2Character;
-  if (!name) return null;
-  return { name, src: characterIconSrc(name), label: characterIconLabel(name) };
-}
 
 // --- Connector line drawing ---
 // Match cards register themselves so we can measure real rendered positions
@@ -265,138 +316,42 @@ watch(
         <div class="bracket-row">
           <div v-for="col in winnersColumns" :key="col.key" class="bracket-col">
             <h3>{{ col.label }}</h3>
-            <div v-for="set in col.sets" :key="set.id" class="match-row">
-              <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
-              <span v-if="hasDraft(set)" class="draft-badge" title="Saved locally, not submitted">●</span>
-              <article
-                class="match-card"
-                :class="{
-                  locked: activeBucketLocked,
-                  drafted: hasDraft(set),
-                  'in-progress': setTimer(set)?.running,
-                }"
-                :title="hasDraft(set) ? 'Has a locally-saved result not yet submitted to start.gg' : ''"
-                :ref="(el) => setCardRef(set.id, el)"
-                @click="onSetClick(set, 'quick-report')"
-                @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
-              >
-                <div
-                  class="slot-row"
-                  :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
-                  :ref="(el) => setSlotRef(set.id, 1, el)"
-                >
-                  <span class="slot-main">
-                    <template v-if="slotCharacter(set, 1)">
-                      <img
-                        v-if="slotCharacter(set, 1).src"
-                        class="slot-char-icon"
-                        :src="slotCharacter(set, 1).src"
-                        :alt="slotCharacter(set, 1).name"
-                      />
-                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 1).label }}</span>
-                    </template>
-                    <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
-                  </span>
-                  <span v-if="!set.player1.placeholder" class="slot-score">{{ slotScore(set.player1) }}</span>
-                </div>
-                <div
-                  class="slot-row"
-                  :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
-                  :ref="(el) => setSlotRef(set.id, 2, el)"
-                >
-                  <span class="slot-main">
-                    <template v-if="slotCharacter(set, 2)">
-                      <img
-                        v-if="slotCharacter(set, 2).src"
-                        class="slot-char-icon"
-                        :src="slotCharacter(set, 2).src"
-                        :alt="slotCharacter(set, 2).name"
-                      />
-                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 2).label }}</span>
-                    </template>
-                    <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
-                  </span>
-                  <span v-if="!set.player2.placeholder" class="slot-score">{{ slotScore(set.player2) }}</span>
-                </div>
-                <div
-                  v-if="setTimer(set)"
-                  class="match-timer"
-                  :class="{ running: setTimer(set).running }"
-                  :title="setTimer(set).running ? 'Set in progress' : 'Set started, timer paused'"
-                >
-                  {{ setTimer(set).running ? "▶" : "⏸" }} {{ setTimer(set).display }}
-                </div>
-              </article>
-            </div>
+            <MatchCard
+              v-for="set in col.sets"
+              :key="set.id"
+              :set="set"
+              :locked="activeBucketLocked"
+              :drafted="hasDraft(set)"
+              :timer="setTimer(set)"
+              :live-score="liveScore(set)"
+              :show-timer-button="canToggleTimer(set)"
+              :register-card="setCardRef"
+              :register-slot="setSlotRef"
+              @quick-report="onSetClick($event, 'quick-report')"
+              @set-on-stream="onSetClick($event, 'set-on-stream')"
+              @toggle-timer="onSetClick($event, 'toggle-timer')"
+            />
           </div>
         </div>
 
         <div v-if="layout.losers.length" class="bracket-row losers-row">
           <div v-for="col in layout.losers" :key="col.key" class="bracket-col">
             <h3>{{ col.label }}</h3>
-            <div v-for="set in col.sets" :key="set.id" class="match-row">
-              <span v-if="set.identifier" class="identifier-badge">{{ set.identifier }}</span>
-              <span v-if="hasDraft(set)" class="draft-badge" title="Saved locally, not submitted">●</span>
-              <article
-                class="match-card"
-                :class="{
-                  locked: activeBucketLocked,
-                  drafted: hasDraft(set),
-                  'in-progress': setTimer(set)?.running,
-                }"
-                :title="hasDraft(set) ? 'Has a locally-saved result not yet submitted to start.gg' : ''"
-                :ref="(el) => setCardRef(set.id, el)"
-                @click="onSetClick(set, 'quick-report')"
-                @contextmenu.prevent="onSetClick(set, 'set-on-stream')"
-              >
-                <div
-                  class="slot-row"
-                  :class="{ winner: isWinnerSlot(set, set.player1), placeholder: set.player1.placeholder }"
-                  :ref="(el) => setSlotRef(set.id, 1, el)"
-                >
-                  <span class="slot-main">
-                    <template v-if="slotCharacter(set, 1)">
-                      <img
-                        v-if="slotCharacter(set, 1).src"
-                        class="slot-char-icon"
-                        :src="slotCharacter(set, 1).src"
-                        :alt="slotCharacter(set, 1).name"
-                      />
-                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 1).label }}</span>
-                    </template>
-                    <span class="slot-name">{{ set.player1.placeholder || set.player1.name }}</span>
-                  </span>
-                  <span v-if="!set.player1.placeholder" class="slot-score">{{ slotScore(set.player1) }}</span>
-                </div>
-                <div
-                  class="slot-row"
-                  :class="{ winner: isWinnerSlot(set, set.player2), placeholder: set.player2.placeholder }"
-                  :ref="(el) => setSlotRef(set.id, 2, el)"
-                >
-                  <span class="slot-main">
-                    <template v-if="slotCharacter(set, 2)">
-                      <img
-                        v-if="slotCharacter(set, 2).src"
-                        class="slot-char-icon"
-                        :src="slotCharacter(set, 2).src"
-                        :alt="slotCharacter(set, 2).name"
-                      />
-                      <span v-else class="slot-char-icon slot-char-fallback">{{ slotCharacter(set, 2).label }}</span>
-                    </template>
-                    <span class="slot-name">{{ set.player2.placeholder || set.player2.name }}</span>
-                  </span>
-                  <span v-if="!set.player2.placeholder" class="slot-score">{{ slotScore(set.player2) }}</span>
-                </div>
-                <div
-                  v-if="setTimer(set)"
-                  class="match-timer"
-                  :class="{ running: setTimer(set).running }"
-                  :title="setTimer(set).running ? 'Set in progress' : 'Set started, timer paused'"
-                >
-                  {{ setTimer(set).running ? "▶" : "⏸" }} {{ setTimer(set).display }}
-                </div>
-              </article>
-            </div>
+            <MatchCard
+              v-for="set in col.sets"
+              :key="set.id"
+              :set="set"
+              :locked="activeBucketLocked"
+              :drafted="hasDraft(set)"
+              :timer="setTimer(set)"
+              :live-score="liveScore(set)"
+              :show-timer-button="canToggleTimer(set)"
+              :register-card="setCardRef"
+              :register-slot="setSlotRef"
+              @quick-report="onSetClick($event, 'quick-report')"
+              @set-on-stream="onSetClick($event, 'set-on-stream')"
+              @toggle-timer="onSetClick($event, 'toggle-timer')"
+            />
           </div>
         </div>
 
@@ -413,6 +368,46 @@ watch(
 
     <div v-else-if="!poolGrid.entrants.length" class="empty-state">
       No entrants found for this pool.
+    </div>
+
+    <div v-else-if="isPoolList" class="pool-list">
+      <p class="pool-list-summary">
+        {{ poolRemainingSets.length }} set{{ poolRemainingSets.length === 1 ? "" : "s" }} left to play
+        <template v-if="poolCompletedSets.length">
+          • {{ poolCompletedSets.length }} done
+          <button type="button" class="link-btn" @click="showCompletedPoolSets = !showCompletedPoolSets">
+            {{ showCompletedPoolSets ? "Hide completed" : "Show completed" }}
+          </button>
+        </template>
+      </p>
+      <div v-if="poolRemainingSets.length" class="pool-list-row">
+        <MatchCard
+          v-for="set in poolRemainingSets"
+          :key="set.id"
+          class="pool-list-card"
+          :set="set"
+          :locked="activeBucketLocked"
+          :drafted="hasDraft(set)"
+          :timer="setTimer(set)"
+          :live-score="liveScore(set)"
+          :show-timer-button="canToggleTimer(set)"
+          @quick-report="onSetClick($event, 'quick-report')"
+          @set-on-stream="onSetClick($event, 'set-on-stream')"
+          @toggle-timer="onSetClick($event, 'toggle-timer')"
+        />
+      </div>
+      <div v-if="showCompletedPoolSets && poolCompletedSets.length" class="pool-list-row completed">
+        <MatchCard
+          v-for="set in poolCompletedSets"
+          :key="set.id"
+          class="pool-list-card"
+          :set="set"
+          :locked="activeBucketLocked"
+          :drafted="hasDraft(set)"
+          @quick-report="onSetClick($event, 'quick-report')"
+          @set-on-stream="onSetClick($event, 'set-on-stream')"
+        />
+      </div>
     </div>
 
     <div v-else class="pool-grid-scroll">
@@ -441,13 +436,25 @@ watch(
                 locked: cell.kind === 'set' && activeBucketLocked,
                 drafted: cell.kind === 'set' && hasDraft(cell.set),
                 'in-progress': cell.kind === 'set' && setTimer(cell.set)?.running,
+                live: cell.kind === 'set' && poolCellScores(row, cell).live,
               }"
               @click="cell.kind === 'set' && onSetClick(cell.set, 'quick-report')"
               @contextmenu.prevent="cell.kind === 'set' && onSetClick(cell.set, 'set-on-stream')"
             >
+              <button
+                v-if="cell.kind === 'set' && canToggleTimer(cell.set)"
+                type="button"
+                class="pool-timer-btn"
+                :class="{ running: setTimer(cell.set)?.running }"
+                :title="setTimer(cell.set)?.running ? 'Pause this set’s timer' : 'Start this set’s timer'"
+                @click.stop="onSetClick(cell.set, 'toggle-timer')"
+                @contextmenu.stop.prevent
+              >
+                {{ setTimer(cell.set)?.running ? "⏸" : "▶" }}
+              </button>
               <span v-if="cell.kind === 'set'" class="pool-score">
-                {{ cell.rowScore === -1 ? "DQ" : cell.rowScore }} -
-                {{ cell.colScore === -1 ? "DQ" : cell.colScore }}
+                {{ scoreLabel(poolCellScores(row, cell).row) }} -
+                {{ scoreLabel(poolCellScores(row, cell).col) }}
               </span>
               <span
                 v-if="cell.kind === 'set' && setTimer(cell.set)"
@@ -530,37 +537,9 @@ watch(
   background: rgba(216, 163, 0, 0.15);
 }
 
-.match-card.drafted {
-  border-color: #d8a300;
-}
-
-.draft-badge {
-  color: #d8a300;
-  font-size: 10px;
-  line-height: 1;
-}
-
 .pool-cell.drafted {
   outline: 1px solid #d8a300;
   outline-offset: -1px;
-}
-
-.match-timer {
-  padding: 2px 6px;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  border-top: 1px solid var(--panel-border);
-  opacity: 0.75;
-}
-
-.match-timer.running {
-  color: #1a6b3c;
-  background: rgba(35, 143, 79, 0.12);
-  opacity: 1;
-}
-
-.match-card.in-progress {
-  border-color: #1a6b3c;
 }
 
 .pool-timer {
@@ -598,7 +577,6 @@ watch(
   .notice-draft {
     color: #ffcc66;
   }
-  .match-timer.running,
   .pool-timer.running,
   .summary-live {
     color: #6fd99a;
@@ -695,6 +673,78 @@ watch(
   background: rgba(161, 30, 30, 0.1);
 }
 
+.pool-cell {
+  position: relative;
+}
+
+.pool-cell.locked {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.pool-cell.live .pool-score {
+  font-style: italic;
+}
+
+.pool-timer-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 8px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+
+.pool-timer-btn.running {
+  background: #1a6b3c;
+  border-color: #1a6b3c;
+  color: #fff;
+}
+
+/* --- Pool list view --- */
+.pool-list {
+  padding: 12px 16px 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.pool-list-summary {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0 4px;
+  font-size: 12px;
+  color: #2366d1;
+  text-decoration: underline;
+}
+
+.pool-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 20px;
+  padding: 8px 10px;
+}
+
+.pool-list-row.completed {
+  opacity: 0.7;
+  border-top: 1px dashed var(--panel-border);
+  padding-top: 16px;
+}
+
+.pool-list-card {
+  width: 200px;
+}
+
 .pool-score {
   font-size: 13px;
   font-weight: 700;
@@ -775,117 +825,6 @@ watch(
   border-bottom: 1px solid var(--panel-border);
 }
 
-.match-row {
-  position: relative;
-}
-
-.match-card {
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  background: var(--panel-bg);
-  cursor: pointer;
-  position: relative;
-  z-index: 1;
-  overflow: hidden;
-}
-
-.match-card.locked,
-.pool-cell.locked {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.match-card:hover {
-  border-color: #2366d1;
-}
-
-.identifier-badge {
-  position: absolute;
-  left: -10px;
-  top: 50%;
-  transform: translateY(-50%);
-  background: #2c2f36;
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 999px;
-  z-index: 2;
-}
-
-.slot-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  font-size: 13px;
-  border-bottom: 1px solid var(--panel-border);
-}
-
-.slot-row:last-child {
-  border-bottom: none;
-}
-
-.slot-row.placeholder {
-  opacity: 0.6;
-  font-style: italic;
-}
-
-.slot-main {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.slot-char-icon {
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-  flex-shrink: 0;
-  object-fit: cover;
-}
-
-.slot-char-fallback {
-  display: grid;
-  place-items: center;
-  font-size: 9px;
-  font-weight: 700;
-  background: #2366d1;
-  color: #fff;
-}
-
-.slot-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.slot-score {
-  min-width: 20px;
-  text-align: center;
-  font-weight: 700;
-  font-size: 12px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.06);
-}
-
-.slot-row.winner {
-  background: rgba(35, 143, 79, 0.12);
-}
-
-.slot-row.winner .slot-name {
-  font-weight: 700;
-}
-
-.slot-row.winner .slot-score {
-  background: #238f4f;
-  color: #fff;
-}
-
 .connector-svg {
   position: absolute;
   top: 0;
@@ -902,9 +841,4 @@ watch(
   stroke-width: 2;
 }
 
-@media (prefers-color-scheme: dark) {
-  .slot-score {
-    background: rgba(255, 255, 255, 0.12);
-  }
-}
 </style>

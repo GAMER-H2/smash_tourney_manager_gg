@@ -16,12 +16,28 @@ It also writes a **TSH-style scoreboard JSON payload** to disk for stream overla
   opponent; DQ-ing both is a double DQ (nobody advances). A DQ replaces the
   per-game result - no game data is sent with it, and start.gg records the
   disqualified entrant's score as `-1`, which the bracket view shows as `DQ`.
-- **Editing / resetting results.** start.gg has no "edit a completed set"
-  mutation, so a reported set shows **Edit result** (reset on start.gg, keeping
-  the current scoreline loaded so it can be corrected and resubmitted) and
-  **Reset result** (reset and clear). Both need a second click to confirm.
+- **Correcting / resetting results.** A reported set's score can be changed
+  directly in the editor and sent with **Resubmit to start.gg**, which corrects
+  it in place (`updateBracketSet`). If start.gg refuses the update, the app
+  falls back to resetting the set and reporting it again. **Reset result**
+  un-reports the set and clears its score (second click to confirm).
   Dependent sets are deliberately *not* reset, so a correction can't silently
   wipe results reported further down the bracket.
+- **Swap Scores / Swap Players.** **Swap Scores** (both editors) hands every
+  game, and any DQ, to the other player while leaving names and characters in
+  place. **Swap Players** (stream editor) moves players to the other side, and
+  their scores and characters go with them. A swap survives tournament refreshes.
+- **Stream editor ↔ bracket sync.** Scores entered on stream (or in a
+  locally-saved result) show on that set's bracket/pool card, dashed/italic
+  until submitted. Opening the on-stream set from the bracket starts from the
+  stream editor's score, and changes made there are mirrored back. Anything
+  this app reports, corrects or resets is laid over start.gg's data for ~90s,
+  so start.gg's cache can't briefly show the old result.
+- **Formats.** Settings hold the best-of options offered in the editors
+  (e.g. `3, 5, 7`) and separate default formats for pools and bracket. A
+  reported set still opens in the format its score shows (a 2-1 was a best of 3).
+- **Pool view.** Settings can switch pools from the round-robin grid to a list
+  of just the sets left to play (in-progress first, completed on request).
 - **Locally-saved results.** Dismissing the quick-report modal (Close, backdrop
   click or Escape) - or pulling a part-scored set off stream - keeps whatever was
   scored, in `local_results.json` next to the config file. Sets carrying one are
@@ -33,7 +49,9 @@ It also writes a **TSH-style scoreboard JSON payload** to disk for stream overla
   timer frozen on how long the set took. Like start.gg, the clock counts **up
   from zero** - a set takes as long as it takes, there's no target length.
   Running sets show their clock on the bracket/pool view (and a count in the
-  header), so it's obvious at a glance which matches are under way, and the
+  header), so it's obvious at a glance which matches are under way. Every
+  playable card and pool cell also has a small ▶/⏸ button to start or pause a
+  set's timer without opening it. The
   stream editor's clock is published to the overlay JSON under a top-level
   `timer` key.
 

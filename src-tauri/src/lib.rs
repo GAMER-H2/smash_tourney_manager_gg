@@ -15,6 +15,22 @@ fn default_preview_source_mode() -> String {
     DEFAULT_PREVIEW_SOURCE_MODE.to_string()
 }
 
+fn default_pool_view_mode() -> String {
+    "grid".to_string()
+}
+
+fn default_pool_best_of() -> u32 {
+    3
+}
+
+fn default_bracket_best_of() -> u32 {
+    5
+}
+
+fn default_best_of_options() -> Vec<u32> {
+    vec![3, 5]
+}
+
 // Bundled at compile time so the character icons this app already ships in
 // its own UI (public/character-icons) can also be staged next to
 // program_state.json for TSH's layouts to render on stream - those layouts
@@ -41,6 +57,19 @@ struct AppConfig {
     // local path / file:// URL to the layout's index.html.
     #[serde(default)]
     overlay_layout_url: String,
+    // "grid" is the round-robin table; "list" shows just the sets a pool
+    // still has to play, as a row of match cards.
+    #[serde(default = "default_pool_view_mode")]
+    pool_view_mode: String,
+    // Format a set opens with when start.gg's data doesn't already say (a
+    // reported score does) - pools and elimination bracket separately.
+    #[serde(default = "default_pool_best_of")]
+    pool_best_of: u32,
+    #[serde(default = "default_bracket_best_of")]
+    bracket_best_of: u32,
+    // The best-of choices offered in the set editors.
+    #[serde(default = "default_best_of_options")]
+    best_of_options: Vec<u32>,
 }
 
 impl Default for AppConfig {
@@ -54,6 +83,10 @@ impl Default for AppConfig {
             auto_write_overlay: true,
             preview_source_mode: default_preview_source_mode(),
             overlay_layout_url: String::new(),
+            pool_view_mode: default_pool_view_mode(),
+            pool_best_of: default_pool_best_of(),
+            bracket_best_of: default_bracket_best_of(),
+            best_of_options: default_best_of_options(),
         }
     }
 }
@@ -2338,8 +2371,24 @@ fn report_set_attempts(request: &ReportSetRequest) -> Vec<(String, Value)> {
     attempts
 }
 
-#[tauri::command]
-async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult, String> {
+// The same shapes as report_set_attempts, but against updateBracketSet:
+// start.gg's mutation for changing the result of a set that's already been
+// reported, without resetting it (and its clock) first.
+fn update_set_attempts(request: &ReportSetRequest) -> Vec<(String, Value)> {
+    report_set_attempts(request)
+        .into_iter()
+        .map(|(query, variables)| {
+            (
+                query
+                    .replace("reportBracketSet(", "updateBracketSet(")
+                    .replace("mutation Report", "mutation Update"),
+                variables,
+            )
+        })
+        .collect()
+}
+
+fn validate_set_result_request(request: &ReportSetRequest) -> Result<(), String> {
     if request.api_token.trim().is_empty() {
         return Err("Missing start.gg API token".to_string());
     }
@@ -2348,16 +2397,20 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
         return Err("Invalid set ID".to_string());
     }
 
-    let is_dq = request.is_dq.unwrap_or(false);
-
     match request.winner_id {
-        Some(0) => return Err("Invalid winner ID".to_string()),
+        Some(0) => Err("Invalid winner ID".to_string()),
         // Only a DQ can legitimately have no winner at all (double DQ).
-        None if !is_dq => return Err("Invalid winner ID".to_string()),
-        _ => {}
+        None if !request.is_dq.unwrap_or(false) => Err("Invalid winner ID".to_string()),
+        _ => Ok(()),
     }
+}
 
-    let attempts = report_set_attempts(&request);
+async fn send_set_result(
+    request: &ReportSetRequest,
+    attempts: Vec<(String, Value)>,
+    verb: &str,
+) -> Result<ReportSetResult, String> {
+    let is_dq = request.is_dq.unwrap_or(false);
     let mut failures = Vec::new();
 
     for (mutation, variables) in attempts {
@@ -2365,11 +2418,11 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
             Ok(_) => {
                 let outcome = match (is_dq, request.winner_id) {
                     (true, Some(winner_id)) => {
-                        format!("reported as a DQ, winner {winner_id}")
+                        format!("{verb} as a DQ, winner {winner_id}")
                     }
-                    (true, None) => "reported as a double DQ".to_string(),
-                    (false, Some(winner_id)) => format!("reported with winner {winner_id}"),
-                    (false, None) => "reported".to_string(),
+                    (true, None) => format!("{verb} as a double DQ"),
+                    (false, Some(winner_id)) => format!("{verb} with winner {winner_id}"),
+                    (false, None) => verb.to_string(),
                 };
 
                 return Ok(ReportSetResult {
@@ -2382,10 +2435,24 @@ async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult,
     }
 
     Err(format!(
-        "Failed to report set after {} attempts: {}",
+        "Failed to {} set after {} attempts: {}",
+        if verb == "updated" { "update" } else { "report" },
         failures.len(),
         failures.join(" | ")
     ))
+}
+
+#[tauri::command]
+async fn report_set_result(request: ReportSetRequest) -> Result<ReportSetResult, String> {
+    validate_set_result_request(&request)?;
+    send_set_result(&request, report_set_attempts(&request), "reported").await
+}
+
+// Changes the result of an already-reported set in place.
+#[tauri::command]
+async fn update_set_result(request: ReportSetRequest) -> Result<ReportSetResult, String> {
+    validate_set_result_request(&request)?;
+    send_set_result(&request, update_set_attempts(&request), "updated").await
 }
 
 // Starts a set on start.gg, the same thing its own bracket UI does when a TO
@@ -2467,9 +2534,9 @@ async fn mark_set_in_progress(
     ))
 }
 
-// Undoes a reported result on start.gg so it can be reported again -
-// start.gg has no "edit a completed set" mutation, so correcting a mistake
-// means resetting the set and re-reporting it.
+// Undoes a reported result on start.gg, putting the set back to not
+// started. Correcting a score doesn't need this (see update_set_result) -
+// it's for when a set shouldn't have been reported at all.
 #[tauri::command]
 async fn reset_set_result(request: ResetSetRequest) -> Result<ReportSetResult, String> {
     if request.api_token.trim().is_empty() {
@@ -2838,6 +2905,7 @@ pub fn run() {
             fetch_game_characters,
             fetch_entrant_avatars,
             report_set_result,
+            update_set_result,
             reset_set_result,
             mark_set_in_progress,
             load_local_results,
@@ -2944,6 +3012,22 @@ mod tests {
             assert!(query.contains("isDQ: true"));
             assert!(!query.contains("$winnerId"));
             assert!(variables.get("winnerId").is_none());
+        }
+    }
+
+    #[test]
+    fn updating_a_set_uses_update_bracket_set_with_the_same_variables() {
+        let mut request = report_request(Some(7), None);
+        request.game_data = Some(game_data());
+
+        let reports = report_set_attempts(&request);
+        let updates = update_set_attempts(&request);
+
+        assert_eq!(updates.len(), reports.len());
+        for ((update, update_vars), (_, report_vars)) in updates.iter().zip(reports.iter()) {
+            assert!(update.contains("updateBracketSet("));
+            assert!(!update.contains("reportBracketSet"));
+            assert_eq!(update_vars, report_vars);
         }
     }
 

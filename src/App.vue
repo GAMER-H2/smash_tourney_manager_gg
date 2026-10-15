@@ -15,6 +15,7 @@ import {
   resetSetResult,
   saveConfig,
   saveLocalResults,
+  updateSetResult,
   writeStreamOverlay,
 } from "./lib/api";
 import {
@@ -29,13 +30,22 @@ import {
   cloneEditorSet,
   createEditorSetFromTournamentSet,
   currentGameCharacter,
+  DEFAULT_BEST_OF_OPTIONS,
+  DEFAULT_BRACKET_BEST_OF,
+  DEFAULT_POOL_BEST_OF,
   emptyEditorSet,
-  emptyGame,
   hasResult,
   isSubmittable,
+  normalizeBestOf,
+  normalizeBestOfOptions,
+  orientLike,
   scoreFor,
+  slotScoresFor,
+  swapScores,
+  swapSides,
   toggleDq,
   winnerEntrantId,
+  withBestOf,
 } from "./lib/set-utils";
 import {
   draftSetIds,
@@ -67,7 +77,25 @@ const config = reactive({
   overlayLayoutUrl: "",
   perPage: 128,
   autoWriteOverlay: true,
+  poolViewMode: "grid",
+  poolBestOf: DEFAULT_POOL_BEST_OF,
+  bracketBestOf: DEFAULT_BRACKET_BEST_OF,
+  bestOfOptions: [...DEFAULT_BEST_OF_OPTIONS],
 });
+
+// The best-of options as typed into settings ("3, 5, 7"), parsed into
+// config.bestOfOptions once the field is left.
+const bestOfOptionsText = ref(DEFAULT_BEST_OF_OPTIONS.join(", "));
+
+function applyBestOfOptionsText() {
+  config.bestOfOptions = normalizeBestOfOptions(bestOfOptionsText.value);
+  bestOfOptionsText.value = config.bestOfOptions.join(", ");
+}
+
+const bestOfDefaults = computed(() => ({
+  poolBestOf: config.poolBestOf,
+  bracketBestOf: config.bracketBestOf,
+}));
 
 const tournamentData = ref(null);
 const activeBucketId = ref("");
@@ -169,16 +197,38 @@ function matchesEntrantPair(set, entrantIdA, entrantIdB) {
 // Safe to guess at: if start.gg's real data disagrees once it comes back,
 // that overwrites this regardless.
 function applyOptimisticResult(bucket, setId, editorSet, winnerEntrantId) {
-  const target = bucket?.sets.find((set) => set.id === setId);
+  const target = bucket?.sets.find((set) => String(set.id) === String(setId));
   if (!target) return;
 
   const winnerSlot = target.player1?.entrantId === winnerEntrantId ? target.player1 : target.player2;
   const loserSlot = target.player1?.entrantId === winnerEntrantId ? target.player2 : target.player1;
 
+  // The editor may have its players the other way round from the bracket
+  // (swapped on stream), so line its scores up with the bracket's slots.
+  const oriented = orientLike(editorSet, target);
+
   target.state = 3;
   target.winnerId = winnerEntrantId ?? null;
-  if (target.player1) target.player1.score = scoreFor(editorSet, 1);
-  if (target.player2) target.player2.score = scoreFor(editorSet, 2);
+  if (target.player1) target.player1.score = scoreFor(oriented, 1);
+  if (target.player2) target.player2.score = scoreFor(oriented, 2);
+  target.player1Character = currentGameCharacter(oriented, 1) || null;
+  target.player2Character = currentGameCharacter(oriented, 2) || null;
+  // Per-game results too, since that's what reopening the set reads back.
+  target.games = oriented.dq
+    ? []
+    : oriented.games
+        .map((game, index) => ({
+          gameNum: index + 1,
+          winnerEntrantId:
+            game.winner === 1
+              ? target.player1?.entrantId
+              : game.winner === 2
+                ? target.player2?.entrantId
+                : null,
+          player1Character: game.player1Character || null,
+          player2Character: game.player2Character || null,
+        }))
+        .filter((game) => game.winnerEntrantId);
 
   // A double DQ completes the set without advancing anyone, so there's
   // nothing to route into the sets downstream of it.
@@ -305,25 +355,19 @@ async function reconcileBucketSync() {
   return newlyLocked;
 }
 
+// Every edit goes through here. `dirty` marks the editor as holding changes
+// start.gg doesn't have, which is what lets a refresh tell an already-reported
+// set that's being corrected apart from one that's just being looked at.
 function updateEditorSet(targetRef, updater) {
   if (!targetRef.value) return;
   const next = cloneEditorSet(targetRef.value);
-  updater(next);
-  targetRef.value = next;
+  const result = updater(next) ?? next;
+  result.dirty = true;
+  targetRef.value = result;
 }
 
 function applyBestOf(targetRef, value) {
-  updateEditorSet(targetRef, (set) => {
-    const bestOf = value === 3 ? 3 : 5;
-    set.bestOf = bestOf;
-    if (set.games.length > bestOf) {
-      set.games = set.games.slice(0, bestOf);
-      return;
-    }
-    while (set.games.length < bestOf) {
-      set.games.push(emptyGame());
-    }
-  });
+  updateEditorSet(targetRef, (set) => withBestOf(set, value));
 }
 
 function applyPlayerName(targetRef, payload) {
@@ -376,14 +420,11 @@ function toggleWinner(targetRef, payload) {
 }
 
 function swapPlayers(targetRef) {
-  updateEditorSet(targetRef, (set) => {
-    [set.player1, set.player2] = [set.player2, set.player1];
-    set.games = set.games.map((game) => ({
-      winner: game.winner === 1 ? 2 : game.winner === 2 ? 1 : null,
-      player1Character: game.player2Character,
-      player2Character: game.player1Character,
-    }));
-  });
+  updateEditorSet(targetRef, swapSides);
+}
+
+function applySwapScores(targetRef) {
+  updateEditorSet(targetRef, swapScores);
 }
 
 // --- Set timers ---------------------------------------------------------
@@ -417,11 +458,11 @@ function timerViewFor(editorSet) {
   };
 }
 
-const setStateById = computed(() => {
+const tournamentSetsById = computed(() => {
   const out = new Map();
   for (const bucket of tournamentData.value?.buckets ?? []) {
     for (const set of bucket.sets ?? []) {
-      out.set(String(set.id), Number(set.state));
+      out.set(String(set.id), set);
     }
   }
   return out;
@@ -437,7 +478,7 @@ const liveSetTimers = computed(() => {
 
   for (const [key, state] of timers.entries()) {
     if (key === STREAM_TIMER_KEY) continue;
-    if (setStateById.value.get(key) === 3) continue;
+    if (Number(tournamentSetsById.value.get(key)?.state) === 3) continue;
 
     const running = isRunning(state);
     if (!running && elapsedMs(state, now) === 0) continue;
@@ -450,6 +491,32 @@ const liveSetTimers = computed(() => {
 
 const streamTimer = computed(() => timerViewFor(streamSet.value));
 const quickReportTimer = computed(() => timerViewFor(quickReportSet.value));
+
+// Scores the bracket view should show for sets start.gg doesn't have a
+// result for yet: anything held as a locally-saved result, and - newest of
+// all - whatever's being scored on stream right now. Keyed by set id and
+// lined up with each set's own slots, since the stream editor may have its
+// players swapped.
+const liveSetScores = computed(() => {
+  const out = new Map();
+  const setsById = tournamentSetsById.value;
+
+  for (const setId of draftSetIds(draftStore.value, config.tournamentSlug)) {
+    const set = setsById.get(String(setId));
+    const draft = getDraft(draftStore.value, setId, config.tournamentSlug);
+    if (set && draft && hasResult(draft.editorSet)) {
+      out.set(String(setId), slotScoresFor(draft.editorSet, set));
+    }
+  }
+
+  const stream = streamSet.value;
+  const streamTournamentSet = stream?.setId ? setsById.get(String(stream.setId)) : null;
+  if (streamTournamentSet && !stream.completed && hasResult(stream)) {
+    out.set(String(stream.setId), slotScoresFor(stream, streamTournamentSet));
+  }
+
+  return out;
+});
 
 // One interval for every timer, running only while at least one of them is,
 // so an idle app isn't waking up four times a second forever.
@@ -521,6 +588,19 @@ async function onToggleTimer(editorSet) {
 
   if (wasRunning || previous.startedOnStartgg) return;
   await startSetOnStartgg(editorSet, key);
+}
+
+// The quick start/pause button on a bracket or pool card - the same timer the
+// set editors drive, without having to open the set first.
+function onBracketToggleTimer(set) {
+  const bucketId = findBucketIdForSetId(tournamentData.value?.buckets, set.id);
+  if (bucketSync.get(bucketId)?.locked) {
+    setError("This pool/bracket hasn't synced with start.gg yet - refresh manually before continuing.");
+    return;
+  }
+
+  syncTimerFromTournamentSet(set);
+  onToggleTimer(createEditorSetFromTournamentSet(set, bestOfDefaults.value));
 }
 
 async function startSetOnStartgg(editorSet, key) {
@@ -719,7 +799,7 @@ async function discardDraft(setId) {
 // has since completed is stale by definition - drop it rather than offering
 // to re-report over a finished set.
 function editorSetForTournamentSet(set) {
-  const fresh = createEditorSetFromTournamentSet(set);
+  const fresh = createEditorSetFromTournamentSet(set, bestOfDefaults.value);
   const draft = getDraft(draftStore.value, set.id, config.tournamentSlug);
   if (!draft) return fresh;
 
@@ -794,8 +874,17 @@ function openQuickReport(set) {
   }
 
   syncTimerFromTournamentSet(set);
-  quickReportSet.value = editorSetForTournamentSet(set);
+  // The set on stream is already being scored in the stream editor, which is
+  // newer than anything start.gg or a saved draft has - open that, so the
+  // two editors can't end up reporting different results for one set.
+  quickReportSet.value = isOnStream(set.id)
+    ? cloneEditorSet(streamSet.value)
+    : editorSetForTournamentSet(set);
   quickReportOpen.value = true;
+}
+
+function isOnStream(setId) {
+  return Boolean(setId) && String(streamSet.value?.setId) === String(setId);
 }
 
 function onStreamBestOf(value) {
@@ -812,6 +901,14 @@ function onStreamGameCharacter(payload) {
 
 function onStreamToggleWinner(payload) {
   toggleWinner(streamSet, payload);
+}
+
+function onStreamSwapScores() {
+  applySwapScores(streamSet);
+}
+
+function onQuickSwapScores() {
+  applySwapScores(quickReportSet);
 }
 
 function onStreamSwapPlayers() {
@@ -868,12 +965,12 @@ function onQuickResetTimer() {
   onResetTimer(quickReportSet.value);
 }
 
-function onStreamReset(payload) {
-  resetSetOnStartgg(streamSet, "stream", payload);
+function onStreamReset() {
+  resetSetOnStartgg(streamSet, "stream");
 }
 
-function onQuickReset(payload) {
-  resetSetOnStartgg(quickReportSet, "quick", payload);
+function onQuickReset() {
+  resetSetOnStartgg(quickReportSet, "quick");
 }
 
 function onStreamSubmit() {
@@ -913,7 +1010,7 @@ function overlayRequestFromEditorSet(editorSet) {
     tournamentName: tournamentData.value?.tournamentName || config.tournamentSlug,
     roundText: editorSet.roundText || "",
     eventName: editorSet.eventName || "",
-    bestOf: editorSet.bestOf === 3 ? 3 : 5,
+    bestOf: normalizeBestOf(editorSet.bestOf),
     player1: {
       name: editorSet.player1.name || "Player 1",
       character: currentGameCharacter(editorSet, 1) || null,
@@ -1021,6 +1118,69 @@ function canonicalizeFetchedCharacters(data) {
   return data;
 }
 
+// start.gg serves cached set data for up to ~60s, so the fetch straight
+// after reporting (or resetting, or correcting) a set routinely comes back
+// describing it as it was *before* - the bracket would show the old result,
+// and the stream editor would offer to report the set all over again. Every
+// change this app makes is remembered here for a little longer than that
+// cache lives, and laid over each fetch until start.gg's data agrees.
+const RECENT_RESULT_TTL_MS = 90_000;
+const recentResults = new Map();
+
+function rememberRecentResult(setId, entry) {
+  recentResults.set(String(setId), { ...entry, expiresAt: Date.now() + RECENT_RESULT_TTL_MS });
+}
+
+function fetchedSetMatchesReport(set, entry) {
+  if (Number(set.state) !== 3) return false;
+  if ((set.winnerId ?? null) !== (entry.winnerId ?? null)) return false;
+  const expected = slotScoresFor(entry.editorSet, set);
+  return (
+    Number(set.player1?.score) === expected.player1 &&
+    Number(set.player2?.score) === expected.player2
+  );
+}
+
+function applyRecentResults(data) {
+  const now = Date.now();
+
+  for (const [setId, entry] of [...recentResults.entries()]) {
+    if (entry.expiresAt <= now) {
+      recentResults.delete(setId);
+      continue;
+    }
+
+    const bucket = data?.buckets?.find((b) => b.sets?.some((set) => String(set.id) === setId));
+    const target = bucket?.sets.find((set) => String(set.id) === setId);
+    if (!target) continue;
+
+    if (entry.kind === "reset") {
+      if (Number(target.state) !== 3 && !target.winnerId) {
+        recentResults.delete(setId);
+        continue;
+      }
+      target.state = 1;
+      target.winnerId = null;
+      target.startedAt = null;
+      target.completedAt = null;
+      target.games = [];
+      target.player1Character = null;
+      target.player2Character = null;
+      if (target.player1) target.player1.score = null;
+      if (target.player2) target.player2.score = null;
+      continue;
+    }
+
+    if (fetchedSetMatchesReport(target, entry)) {
+      recentResults.delete(setId);
+      continue;
+    }
+    applyOptimisticResult(bucket, setId, entry.editorSet, entry.winnerId);
+  }
+
+  return data;
+}
+
 async function fetchAndApplyTournamentData() {
   const data = await fetchTournamentState({
     apiToken: config.apiToken,
@@ -1030,6 +1190,7 @@ async function fetchAndApplyTournamentData() {
 
   canonicalizeFetchedCharacters(data);
   collapseBucketByes(data);
+  applyRecentResults(data);
   tournamentData.value = data;
   return data;
 }
@@ -1070,25 +1231,10 @@ async function finishTournamentRefresh({ silent = false } = {}) {
 
   if (streamSet.value?.setId) {
     const allSets = (data?.buckets || []).flatMap((bucket) => bucket.sets || []);
-    const matching = allSets.find((set) => set.id === streamSet.value.setId);
+    const matching = allSets.find((set) => String(set.id) === String(streamSet.value.setId));
     if (matching) {
       syncTimerFromTournamentSet(matching);
-      const updated = createEditorSetFromTournamentSet(matching);
-      updated.games.forEach((game, index) => {
-        const previousGame = streamSet.value.games[index];
-        if (!previousGame) return;
-        game.player1Character = previousGame.player1Character;
-        game.player2Character = previousGame.player2Character;
-      });
-
-      // A refresh must never wipe scores the TO has entered but not yet
-      // submitted - start.gg simply doesn't know about those yet.
-      if (!updated.completed && !hasResult(updated) && hasResult(streamSet.value)) {
-        updated.games = cloneEditorSet(streamSet.value).games;
-        updated.dq = streamSet.value.dq;
-      }
-
-      streamSet.value = updated;
+      streamSet.value = mergeFetchedIntoEditorSet(streamSet.value, matching);
     }
   }
 
@@ -1096,6 +1242,52 @@ async function finishTournamentRefresh({ silent = false } = {}) {
   if (!silent && !bucketJustLocked) {
     setSuccess(`Loaded ${data?.totalSets ?? 0} sets from ${data?.tournamentName ?? ""}.`);
   }
+}
+
+// Folds a fresh start.gg copy of a set into the editor already holding it.
+// The editor's own state wins wherever it's newer than start.gg can be:
+//  - its player order, so a swap made on stream survives the refresh (and
+//    the scores and characters stay with the right player);
+//  - its score, format and DQ, unless start.gg has a result the editor
+//    doesn't (reported from elsewhere, or just submitted from here) - and
+//    even then not while a reported result is being corrected here;
+//  - names typed in for the same entrant, and character picks.
+function mergeFetchedIntoEditorSet(current, tournamentSet) {
+  const fetched = orientLike(
+    createEditorSetFromTournamentSet(tournamentSet, bestOfDefaults.value),
+    current,
+  );
+
+  const keepLocalResult = fetched.completed
+    ? Boolean(current.completed && current.dirty)
+    : hasResult(current) || !hasResult(fetched);
+
+  const merged = keepLocalResult
+    ? {
+        ...fetched,
+        bestOf: current.bestOf,
+        dq: current.dq,
+        games: cloneEditorSet(current).games,
+        dirty: Boolean(current.dirty),
+      }
+    : fetched;
+
+  if (!keepLocalResult) {
+    merged.games.forEach((game, index) => {
+      const previousGame = current.games?.[index];
+      if (!previousGame) return;
+      game.player1Character = previousGame.player1Character || game.player1Character;
+      game.player2Character = previousGame.player2Character || game.player2Character;
+    });
+  }
+
+  for (const key of ["player1", "player2"]) {
+    if (current[key]?.entrantId && current[key].entrantId === merged[key]?.entrantId) {
+      merged[key] = { ...merged[key], name: current[key].name };
+    }
+  }
+
+  return merged;
 }
 
 async function refreshTournament({ silent = false } = {}) {
@@ -1124,6 +1316,10 @@ async function persistConfig() {
       overlayLayoutUrl: config.overlayLayoutUrl.trim(),
       perPage: Number(config.perPage) || 128,
       autoWriteOverlay: config.autoWriteOverlay,
+      poolViewMode: config.poolViewMode,
+      poolBestOf: normalizeBestOf(config.poolBestOf, DEFAULT_POOL_BEST_OF),
+      bracketBestOf: normalizeBestOf(config.bracketBestOf, DEFAULT_BRACKET_BEST_OF),
+      bestOfOptions: normalizeBestOfOptions(config.bestOfOptions),
     });
     setSuccess("Settings saved.");
   } catch (err) {
@@ -1198,6 +1394,16 @@ async function submitSet(editorSet, mode) {
     return;
   }
 
+  // A set start.gg already has a result for is corrected in place rather
+  // than reported again.
+  const resubmitting = Boolean(editorSet.completed);
+  if (resubmitting && pending) {
+    setError(
+      `"${pending.snapshot.name}" is still syncing with start.gg - wait for it to reload before correcting a result there.`,
+    );
+    return;
+  }
+
   if (mode === "stream") {
     submittingStream.value = true;
   } else {
@@ -1241,24 +1447,39 @@ async function submitSet(editorSet, mode) {
       return;
     }
 
-    await reportSetResult({
+    const request = {
       apiToken: config.apiToken,
       setId: editorSet.setId,
       winnerId,
       gameData: gameDataPayload,
       isDq: Boolean(dq),
-    });
+    };
+
+    if (resubmitting) {
+      await resubmitSetResult(request, mode);
+    } else {
+      await reportSetResult(request);
+    }
 
     // It's on start.gg now, so the locally-held copy has served its purpose,
     // and start.gg has stopped timing the set - so this timer stops too.
+    rememberRecentResult(editorSet.setId, {
+      kind: "reported",
+      editorSet: cloneEditorSet(editorSet),
+      winnerId,
+    });
     await discardDraft(editorSet.setId);
     stopTimerForSet(editorSet.setId);
 
-    setSuccess(
-      dq
-        ? `Reported set ${editorSet.setId} to start.gg as a DQ.`
-        : `Reported set ${editorSet.setId} to start.gg.`,
-    );
+    // What's in the editor is now exactly what start.gg has.
+    if (isOnStream(editorSet.setId)) {
+      streamSet.value = { ...cloneEditorSet(streamSet.value), dirty: false };
+    }
+
+    const done = resubmitting
+      ? `Updated set ${editorSet.setId} on start.gg`
+      : `Reported set ${editorSet.setId} to start.gg`;
+    setSuccess(dq ? `${done} as a DQ.` : `${done}.`);
 
     if (mode === "stream") {
       await writeOverlayFromStreamSet(true);
@@ -1306,12 +1527,42 @@ async function submitSet(editorSet, mode) {
   }
 }
 
-// start.gg has no "edit a completed set" mutation - correcting a reported
-// result means resetting the set there and reporting it again. `keepScores`
-// is the difference between the two buttons this backs: "Edit result" keeps
-// the existing games loaded so a wrong scoreline can be adjusted and
-// resubmitted, while "Reset result" clears them for a fresh report.
-async function resetSetOnStartgg(targetRef, mode, { keepScores = false } = {}) {
+// Corrects an already-reported set's result. start.gg's updateBracketSet
+// does that in place; if it refuses (it can, e.g. for some changes of
+// winner), fall back to what used to be the manual route - reset the set,
+// then report it again.
+async function resubmitSetResult(request, mode) {
+  try {
+    await updateSetResult(request);
+    return;
+  } catch (updateErr) {
+    console.warn("updateBracketSet was rejected, falling back to reset + report", updateErr);
+  }
+
+  await resetSetResult({
+    apiToken: request.apiToken,
+    setId: request.setId,
+    resetDependentSets: false,
+  });
+
+  try {
+    await reportSetResult(request);
+  } catch (err) {
+    // The set is now reset on start.gg with no result - make sure the
+    // editor says so, so the next submit reports rather than corrects.
+    const targetRef = mode === "stream" ? streamSet : quickReportSet;
+    if (String(targetRef.value?.setId) === String(request.setId)) {
+      targetRef.value = { ...cloneEditorSet(targetRef.value), completed: false };
+    }
+    rememberRecentResult(request.setId, { kind: "reset" });
+    throw new Error(`the set was reset on start.gg but re-reporting it failed (${String(err)}) - submit it again`);
+  }
+}
+
+// Un-reports a set on start.gg and clears its score here, for a set that
+// shouldn't have been reported at all. (Correcting a score doesn't need
+// this - just change it and resubmit.)
+async function resetSetOnStartgg(targetRef, mode) {
   const editorSet = targetRef.value;
 
   if (!editorSet?.setId) {
@@ -1343,20 +1594,15 @@ async function resetSetOnStartgg(targetRef, mode, { keepScores = false } = {}) {
       resetDependentSets: false,
     });
 
-    const reopened = keepScores
-      ? { ...cloneEditorSet(editorSet), completed: false }
-      : clearResults(editorSet);
+    const reopened = { ...clearResults(editorSet), dirty: false };
+    rememberRecentResult(editorSet.setId, { kind: "reset" });
 
     targetRef.value = reopened;
     // resetSet clears start.gg's own start time as well as the result, so
     // the set really is back to "not started" - including its clock.
     if (timers.has(timerKey(editorSet))) timers.set(timerKey(editorSet), resetTimer());
 
-    setSuccess(
-      keepScores
-        ? `Set ${editorSet.setId} reset on start.gg - adjust the result and submit it again.`
-        : `Set ${editorSet.setId} reset on start.gg.`,
-    );
+    setSuccess(`Set ${editorSet.setId} reset on start.gg.`);
 
     await fetchAndApplyTournamentData();
     await finishTournamentRefresh({ silent: true });
@@ -1377,6 +1623,15 @@ async function resetSetOnStartgg(targetRef, mode, { keepScores = false } = {}) {
 }
 
 watch(streamSet, scheduleOverlayWrite, { deep: true });
+
+// The quick-report modal can be opened on the set that's on stream (it then
+// starts from the stream editor's state - see openQuickReport); anything
+// changed there is mirrored straight back, keeping the stream's own player
+// order, so the two never disagree about one set.
+watch(quickReportSet, (quick) => {
+  if (!quick?.setId || !isOnStream(quick.setId)) return;
+  streamSet.value = orientLike(quick, streamSet.value);
+});
 watch(
   () => config.streamOutputPath,
   () => scheduleOverlayWrite(),
@@ -1394,6 +1649,7 @@ watch(
   () => [config.apiToken, config.tournamentSlug],
   () => {
     bucketSync.clear();
+    recentResults.clear();
     timers.clear();
     stopTimerTick();
     if (bucketSyncRetryTimer) {
@@ -1426,6 +1682,11 @@ onMounted(async () => {
     config.overlayLayoutUrl = loaded.overlayLayoutUrl || "";
     config.perPage = loaded.perPage || 128;
     config.autoWriteOverlay = loaded.autoWriteOverlay ?? true;
+    config.poolViewMode = loaded.poolViewMode === "list" ? "list" : "grid";
+    config.poolBestOf = normalizeBestOf(loaded.poolBestOf, DEFAULT_POOL_BEST_OF);
+    config.bracketBestOf = normalizeBestOf(loaded.bracketBestOf, DEFAULT_BRACKET_BEST_OF);
+    config.bestOfOptions = normalizeBestOfOptions(loaded.bestOfOptions);
+    bestOfOptionsText.value = config.bestOfOptions.join(", ");
     configLoaded.value = true;
 
     configPanelOpen.value = !(config.apiToken && config.tournamentSlug);
@@ -1466,6 +1727,12 @@ onBeforeUnmount(() => {
   }
   stopTimerTick();
 });
+
+// The configured best-of options plus whatever's currently selected, so a
+// default doesn't vanish from its own dropdown when its option is removed.
+function bestOfChoices(selected) {
+  return [...new Set([...config.bestOfOptions, selected])].sort((a, b) => a - b);
+}
 
 const showStatus = computed(() => Boolean(statusMessage.value));
 const showError = computed(() => Boolean(errorMessage.value));
@@ -1536,6 +1803,42 @@ const showError = computed(() => Boolean(errorMessage.value));
           </label>
 
           <label>
+            Pool view
+            <select v-model="config.poolViewMode">
+              <option value="grid">Grid (round-robin table)</option>
+              <option value="list">List (sets left to play)</option>
+            </select>
+          </label>
+
+          <label>
+            Best-of options (comma separated)
+            <input
+              v-model="bestOfOptionsText"
+              type="text"
+              placeholder="3, 5, 7"
+              @change="applyBestOfOptionsText"
+            />
+          </label>
+
+          <label>
+            Default format for pools
+            <select v-model.number="config.poolBestOf">
+              <option v-for="option in bestOfChoices(config.poolBestOf)" :key="option" :value="option">
+                Best of {{ option }}
+              </option>
+            </select>
+          </label>
+
+          <label>
+            Default format for bracket
+            <select v-model.number="config.bracketBestOf">
+              <option v-for="option in bestOfChoices(config.bracketBestOf)" :key="option" :value="option">
+                Best of {{ option }}
+              </option>
+            </select>
+          </label>
+
+          <label>
             Overlay layout URL or file
             <input
               v-model="config.overlayLayoutUrl"
@@ -1577,12 +1880,14 @@ const showError = computed(() => Boolean(errorMessage.value));
         :allow-swap="true"
         :timer="streamTimer"
         :draft="streamDraft"
+        :best-of-options="config.bestOfOptions"
         @set-best-of="onStreamBestOf"
         @set-player-name="onStreamPlayerName"
         @set-game-character="onStreamGameCharacter"
         @toggle-game-winner="onStreamToggleWinner"
         @toggle-dq="onStreamToggleDq"
         @swap-players="onStreamSwapPlayers"
+        @swap-scores="onStreamSwapScores"
         @apply-overlay="writeOverlayFromStreamSet(false)"
         @reset-result="onStreamReset"
         @toggle-timer="onStreamToggleTimer"
@@ -1597,9 +1902,12 @@ const showError = computed(() => Boolean(errorMessage.value));
       :bucket-sync-state="bucketSync"
       :drafted-set-ids="draftedSetIds"
       :set-timers="liveSetTimers"
+      :live-scores="liveSetScores"
+      :pool-view-mode="config.poolViewMode"
       @update:activeBucketId="onBucketChange"
       @set-on-stream="loadStreamSetFromTournamentSet"
       @quick-report="openQuickReport"
+      @toggle-timer="onBracketToggleTimer"
     />
 
     <div v-if="quickReportOpen" class="modal-backdrop" @click.self="closeQuickReport()">
@@ -1614,12 +1922,14 @@ const showError = computed(() => Boolean(errorMessage.value));
           :show-close="true"
           :timer="quickReportTimer"
           :draft="quickReportDraft"
+          :best-of-options="config.bestOfOptions"
           @close="closeQuickReport()"
           @set-best-of="onQuickBestOf"
           @set-player-name="onQuickPlayerName"
           @set-game-character="onQuickGameCharacter"
           @toggle-game-winner="onQuickToggleWinner"
           @toggle-dq="onQuickToggleDq"
+          @swap-scores="onQuickSwapScores"
           @reset-result="onQuickReset"
           @toggle-timer="onQuickToggleTimer"
           @reset-timer="onQuickResetTimer"

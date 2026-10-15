@@ -13,10 +13,18 @@ import {
   hasResult,
   isDq,
   isSubmittable,
+  normalizeBestOf,
+  normalizeBestOfOptions,
+  orientLike,
+  resolveBestOf,
   scoreFor,
+  slotScoresFor,
+  swapScores,
+  swapSides,
   toggleDq,
   winnerEntrantId,
   winsFor,
+  withBestOf,
 } from "../src/lib/set-utils";
 
 function tournamentSet(overrides = {}) {
@@ -227,5 +235,97 @@ describe("submittability and clearing results", () => {
     expect(
       createEditorSetFromTournamentSet(tournamentSet({ state: 3, winnerId: 1 })).completed,
     ).toBe(true);
+  });
+});
+
+describe("best-of formats", () => {
+  it("only accepts odd formats in a sane range", () => {
+    expect(normalizeBestOf(7)).toBe(7);
+    expect(normalizeBestOf("9")).toBe(9);
+    expect(normalizeBestOf(4)).toBe(5);
+    expect(normalizeBestOf(0, 3)).toBe(3);
+    expect(normalizeBestOf("junk", 3)).toBe(3);
+  });
+
+  it("parses the settings list, dropping anything unusable", () => {
+    expect(normalizeBestOfOptions("7, 3,5 , 5, 4, x")).toEqual([3, 5, 7]);
+    expect(normalizeBestOfOptions([5, 3])).toEqual([3, 5]);
+    expect(normalizeBestOfOptions("")).toEqual([3, 5]);
+  });
+
+  it("opens unreported sets with the configured pool or bracket default", () => {
+    const defaults = { poolBestOf: 3, bracketBestOf: 7 };
+    expect(resolveBestOf(tournamentSet({ round: 2 }), defaults)).toBe(7);
+    expect(resolveBestOf(tournamentSet({ round: 0, phaseName: "Pools" }), defaults)).toBe(3);
+  });
+
+  it("infers a reported set's format from its score", () => {
+    const defaults = { poolBestOf: 3, bracketBestOf: 5 };
+    const reported = (p1, p2) =>
+      tournamentSet({
+        round: 2,
+        state: 3,
+        winnerId: 1,
+        player1: { entrantId: 1, name: "Alice", score: p1 },
+        player2: { entrantId: 2, name: "Bob", score: p2 },
+      });
+
+    expect(resolveBestOf(reported(2, 1), defaults)).toBe(3);
+    expect(resolveBestOf(reported(4, 2), defaults)).toBe(7);
+    // A DQ says nothing about the format.
+    expect(resolveBestOf(reported(0, -1), defaults)).toBe(5);
+  });
+
+  it("builds a best of 7 that's only decided at four wins", () => {
+    const set = createEditorSetFromTournamentSet(tournamentSet({ round: 2 }), {
+      poolBestOf: 3,
+      bracketBestOf: 7,
+    });
+    expect(set.games).toHaveLength(7);
+
+    set.games.slice(0, 3).forEach((game) => (game.winner = 1));
+    expect(isSubmittable(set)).toBe(false);
+    set.games[3].winner = 1;
+    expect(isSubmittable(set)).toBe(true);
+  });
+
+  it("resizes a set's games, keeping the ones already played", () => {
+    const resized = withBestOf(editorSetWith([1, 2, null]), 7);
+    expect(resized.bestOf).toBe(7);
+    expect(resized.games.map((game) => game.winner)).toEqual([1, 2, null, null, null, null, null]);
+    expect(withBestOf(resized, 3).games).toHaveLength(3);
+  });
+});
+
+describe("swapping and orientation", () => {
+  it("swaps scores without moving players or characters", () => {
+    const set = editorSetWith([1, 1, null], { dq: null });
+    set.games[0].player1Character = "Fox";
+    const swapped = swapScores(set);
+
+    expect(swapped.games.map((game) => game.winner)).toEqual([2, 2, null]);
+    expect(swapped.player1.name).toBe(set.player1.name);
+    expect(swapped.games[0].player1Character).toBe("Fox");
+    expect(swapScores(editorSetWith([], { dq: 1 })).dq).toBe(2);
+  });
+
+  it("swaps players with their scores, characters and DQ", () => {
+    const set = editorSetWith([1, null, null], { dq: 1 });
+    set.games[0].player1Character = "Fox";
+    const swapped = swapSides(set);
+
+    expect(swapped.player1.entrantId).toBe(2);
+    expect(swapped.games[0].winner).toBe(2);
+    expect(swapped.games[0].player2Character).toBe("Fox");
+    expect(swapped.dq).toBe(2);
+  });
+
+  it("lines a swapped editor up with the bracket's slots", () => {
+    const swapped = swapSides(editorSetWith([1, null, null]));
+    const set = tournamentSet();
+
+    expect(orientLike(swapped, set).player1.entrantId).toBe(1);
+    expect(orientLike(swapped, set).games[0].winner).toBe(1);
+    expect(slotScoresFor(swapped, set)).toEqual({ player1: 1, player2: 0 });
   });
 });

@@ -51,3 +51,7 @@ export async function getPlatform() {
 export async function allowOverlayLayoutPath(path) {
   return invoke("allow_overlay_layout_path", { path });
 }
+
+export async function updateSetResult(request) {
+  return invoke("update_set_result", { request });
+}
