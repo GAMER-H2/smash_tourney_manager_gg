@@ -101,7 +101,14 @@ configuration works on every machine:
 OBS registers its virtual camera machine-wide, which needs administrator
 rights, so a locked-down tournament account running portable OBS normally has
 no virtual camera at all. `scripts/register-obs-virtualcam-peruser.ps1`
+<<<<<<< Updated upstream
 registers the filter for the current user instead, and the app launches its
+=======
+registers the filter for the current user instead — writing the COM keys under
+`HKCU` directly, because `regsvr32` cannot be coaxed into a per-user
+registration for this DLL — and `scripts/test-obs-virtualcam.ps1` checks the
+result without needing the app built. The app launches its
+>>>>>>> Stashed changes
 webview with `--disable-features=MediaFoundationVideoCapture` so camera
 enumeration happens in-process under that user's registry hive rather than in
 the Windows Camera Frame Server service, which can only see machine-wide
